@@ -1,7 +1,7 @@
 ---
 name: "spark-troubleshooting-agent"
 displayName: "Troubleshoot Spark applications on AWS"
-description: "Troubleshoot Spark applications on AWS EMR, Glue, and SageMaker - analyze failures, identify bottlenecks, get code recommendations. For more info, please see: https://docs.aws.amazon.com/emr/latest/ReleaseGuide/spark-troubleshoot.html"
+description: "Troubleshoot failed Spark applications on AWS EMR, Glue, and SageMaker Unified Studio - analyze failures, identify root causes, get code recommendations. For more info, please see: https://docs.aws.amazon.com/emr/latest/ReleaseGuide/spark-troubleshoot.html"
 keywords: ["spark", "emr", "glue", "sagemaker", "troubleshooting", "pyspark", "scala", "performance", "debugging", "aws"]
 author: "AWS"
 ---
@@ -63,14 +63,13 @@ Region and role ARN will be in the outputs tab. These will be used in the next s
 
 # Overview
 
-Troubleshoot Apache Spark applications on Amazon EMR, AWS Glue, and Amazon SageMaker through natural language. The agent analyzes failed jobs, identifies performance bottlenecks, and provides code recommendations.
+Troubleshoot failed Apache Spark applications on Amazon EMR, AWS Glue, and Amazon SageMaker Unified Studio through natural language. The agent analyzes failed jobs, identifies root causes, and provides code recommendations.
 
 **Key capabilities:**
-- **Failure Analysis**: Analyze failed PySpark and Scala jobs
-- **Root Cause Identification**: Correlate telemetry and identify issues
-- **Performance Diagnostics**: Find bottlenecks and resource problems
-- **Code Recommendations**: Get specific fixes and optimizations
-- **Multi-Platform**: EMR EC2, EMR Serverless, Glue, SageMaker
+- **Failure Analysis**: Analyze failed PySpark and Scala jobs across platforms
+- **Root Cause Identification**: Analyze Spark event logs, error stack traces, resource metrics, query plans, and configurations to identify failure causes
+- **Code Recommendations**: Get specific code fixes for failed applications (EMR EC2, Glue, SageMaker Unified Studio)
+- **Multi-Platform**: EMR EC2, EMR Serverless, Glue, SageMaker Unified Studio
 
 **Note**: Preview service using cross-region inference for AI processing.
 
@@ -80,41 +79,41 @@ Troubleshoot Apache Spark applications on Amazon EMR, AWS Glue, and Amazon SageM
 **Connection:** MCP Proxy for AWS
 **Authentication:** AWS IAM role assumption
 **Timeout:** 180 seconds
+**Supported Platforms:** EMR EC2, EMR Serverless, AWS Glue, SageMaker Unified Studio
 
-Analyzes Spark application failures and identifies root causes through:
-- Feature extraction from Spark History Server logs
-- Telemetry data collection and analysis
-- Root cause identification using AI
-- Performance metric correlation
-- Error pattern recognition
+Analyzes failed Spark workloads by examining:
+- Spark event logs and error stack traces
+- Resource usage metrics (CPU, memory, I/O, network via CloudWatch)
+- Query plans and executor timelines
+- Spark configuration parameters
+- Provides root cause identification and diagnostic explanations
 
 ### sagemaker-unified-studio-mcp-code-rec
-**Connection:** MCP Proxy for AWS  
+**Connection:** MCP Proxy for AWS
 **Authentication:** AWS IAM role assumption
 **Timeout:** 180 seconds
+**Supported Platforms:** EMR EC2, AWS Glue, SageMaker Unified Studio
 
-Generates code recommendations based on root cause analysis:
-- Code pattern analysis
-- Optimization recommendations
-- Configuration adjustments
-- Architectural improvements
-- Specific code fixes with examples
+**Note:** Code recommendations are **not available** for EMR Serverless. Use the troubleshooting server for EMR Serverless failure analysis.
+
+Generates code recommendations for failed PySpark applications:
+- Analyzes failed application code and provides specific code fixes
+- Returns a code diff with recommended changes
+- **PySpark only** — Scala workloads receive troubleshooting analysis but not code recommendations
 
 ## Usage Examples
 
 ### Basic Troubleshooting Request
 
 ```
-"My Spark job on EMR cluster j-XXXXX failed. 
-Application ID: application_1234567890_0001
+"My Spark job on EMR failed. Cluster ID: j-1234567890ABC, Step ID: s-1234567890ABC.
 Can you analyze what went wrong?"
 ```
 
 The agent will:
-1. Extract telemetry from Spark History Server
-2. Analyze error traces and logs
-3. Identify root cause
-4. Provide diagnostic explanation
+1. Analyze Spark event logs and error stack traces
+2. Identify root cause
+3. Provide diagnostic explanation
 
 ### Request Code Recommendations
 
@@ -123,66 +122,41 @@ The agent will:
 ```
 
 The agent will:
-1. Analyze code patterns
-2. Identify inefficient operations
-3. Provide specific code modifications
-4. Suggest configuration tuning
+1. Analyze the failed application code
+2. Provide a code diff with specific fixes
 
 ## Common Troubleshooting Scenarios
 
 ### OutOfMemory Errors
 
 ```
-"My EMR Serverless job app-XXXXX (job jr-XXXXX) is failing with OutOfMemoryError. 
-Can you analyze memory usage and suggest optimizations?"
+"My EMR Serverless job failed with OutOfMemoryError.
+Application ID: 00abcdef12345678, Job Run ID: 00abcdef87654321.
+Can you analyze what went wrong?"
 ```
 
 Agent analyzes:
-- Executor memory configuration
+- Executor memory configuration and resource metrics
 - Partition sizes and data skew
 - Memory-intensive operations
-- Provides memory tuning and code optimizations
+- Provides root cause analysis and diagnostic explanation
 
-### Slow Performance
+### Failed Glue Job
 
 ```
-"My Glue job glue-job-XXXXX used to complete in 10 minutes but now takes 
-over an hour. Can you identify the bottleneck?"
+"My Glue job 'daily-etl' failed on run jr_abc123def456abc123def456abc12345.
+Can you analyze what went wrong?"
 ```
 
 Agent analyzes:
-- Stage execution times
-- Data skew in partitions
-- Shuffle operations
-- Resource utilization
-- Provides partitioning and optimization recommendations
+- Error stack traces and failure patterns
+- Stage execution issues
+- Resource utilization problems
+- Provides root cause analysis and suggested fixes
 
-### Data Skew
+### SageMaker Unified Studio
 
-```
-"My SageMaker Spark job has extreme data skew - most tasks finish quickly 
-but a few take forever. How can I fix this?"
-```
-
-Agent provides:
-- Skewed partition identification
-- Data distribution analysis
-- Salting techniques
-- Repartitioning strategies
-- Code examples
-
-### Performance Optimization
-
-```
-"Can you review my EMR job j-XXXXX configuration and suggest performance optimizations?"
-```
-
-Agent reviews:
-- Spark configuration settings
-- Resource allocation
-- Executor and driver sizing
-- Dynamic allocation settings
-- Shuffle operation tuning
+**Note:** SageMaker Unified Studio (SMUS) has built-in troubleshooting capabilities through its own UI, which provides richer context including session information. SMUS users should use the built-in assistant for the best experience. This power is primarily intended for **EMR EC2, EMR Serverless, and Glue** troubleshooting.
 
 ## Best Practices
 
@@ -226,20 +200,16 @@ Agent reviews:
 ### "Insufficient permissions"
 **Cause:** IAM role missing permissions
 **Solution:**
-- Verify CloudFormation stack created successfully
-- Check IAM permissions:
-  - EMR: `elasticmapreduce:Describe*`, `elasticmapreduce:List*`
-  - Glue: `glue:GetJobRun`, `glue:GetJobRuns`
-  - S3: `s3:GetObject` for logs
-  - CloudWatch: `logs:GetLogEvents`
-- Re-deploy CloudFormation if needed
+- Verify CloudFormation stack created successfully in the correct region
+- Check that the IAM role ARN in your `smus-mcp-profile` matches the stack outputs
+- Re-deploy the CloudFormation stack if needed — it defines all required permissions
 
 ### "No recommendations generated"
-**Cause:** No actionable improvements identified
+**Cause:** No actionable code fixes identified for the failure
 **Solution:**
-- Job may be well-optimized
-- Ask specific questions: "analyze memory usage"
-- Provide more context about expected vs actual performance
+- Ask more specific questions about the failure: "what caused the OutOfMemoryError?"
+- Provide additional context: error messages, data sizes, job configuration
+- Ensure you provided the correct job/step/run identifiers
 
 ## MCP Config Placeholders
 
@@ -280,35 +250,17 @@ Agent reviews:
 
 **Authentication:** AWS IAM role via CloudFormation stack
 
-**Required Permissions:**
-- EMR: `elasticmapreduce:Describe*`, `elasticmapreduce:List*`
-- Glue: `glue:GetJobRun`, `glue:GetJobRuns`
-- SageMaker: `sagemaker:DescribeProcessingJob`
-- S3: `s3:GetObject` (logs)
-- CloudWatch: `logs:GetLogEvents`
+**Required Permissions:** Managed by the CloudFormation stack deployed during onboarding. See the stack template for the full list of IAM permissions granted.
 
 **Supported Platforms:**
 - Amazon EMR on EC2
 - Amazon EMR Serverless
 - AWS Glue (Spark jobs)
-- Amazon SageMaker (Spark kernels)
+- Amazon SageMaker Unified Studio (%%pyspark notebook cells — primarily use the built-in SMUS assistant instead)
 
 **Supported Languages:**
 - PySpark (Python)
 - Scala
-
-## Tips
-
-1. **Be specific** - Include cluster ID, application ID, or job run ID
-2. **Provide context** - Explain expected vs. actual behavior  
-3. **Start with symptoms** - Describe what you're seeing
-4. **Ask follow-ups** - Dig deeper into recommendations
-5. **Test incrementally** - Apply one change at a time
-6. **Monitor results** - Track metrics after changes
-7. **Use natural language** - Explain in your own words
-8. **Request examples** - Ask for code samples
-9. **Consider costs** - Some optimizations use more resources
-10. **Review audit logs** - Check CloudTrail for compliance
 
 ---
 

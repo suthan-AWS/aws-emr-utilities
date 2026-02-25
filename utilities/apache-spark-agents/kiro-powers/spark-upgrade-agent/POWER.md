@@ -31,6 +31,11 @@ Before proceeding, ensure the following are installed:
     - You can do this with `echo ${AWS_PROFILE}`. No response likely means they are using the `default` profile
     - use this profile later when configuring the `spark-upgrade-profile`
 
+- **Local Spark project**: Your Spark application source code must be available on the local filesystem
+  - The upgrade agent reads and modifies files locally — it does not work on remote repositories directly
+  - Clone or check out your project to a local directory before starting
+  - **Recommended**: Commit your current code to version control before starting so you can easily review or revert changes
+
 **CRITICAL**: If any prerequisites are missing, DO NOT proceed. Install missing components first.
 
 ## Step 2: Deploy CloudFormation Stack
@@ -69,25 +74,27 @@ Before proceeding, ensure the following are installed:
 The Apache Spark Upgrade Agent for Amazon EMR is a conversational AI capability that accelerates Apache Spark version upgrades for your EMR applications. Traditional Spark upgrades require months of engineering effort to analyze API changes, resolve dependency conflicts, and validate functional correctness. The agent simplifies the upgrade process through natural language prompts, automated code transformation, and data quality validation.
 
 **Key capabilities:**
-- **Automated Code Transformation**: Automatically updates code for Spark version compatibility
-- **Dependency Resolution**: Resolves version conflicts and updates build configurations
+- **Upgrade Planning**: Analyzes project structure and generates a comprehensive upgrade plan
+- **Build & Dependency Updates**: Resolves version conflicts and updates build configurations
+- **Iterative Failure Fixing**: Analyzes build and runtime failures and suggests targeted fixes
 - **Validation Testing**: Submits and monitors remote validation jobs on EMR
-- **Data Quality Validation**: Ensures data integrity throughout the upgrade process
-- **Natural Language Interface**: Interact using conversational prompts
+- **Data Quality Validation**: Compares output between source and target Spark versions
 - **Multi-Platform Support**: EMR EC2 and EMR Serverless
 - **Multi-Language Support**: PySpark (Python) and Scala
 
 **Note**: Preview service using cross-region inference for AI processing.
 
-## Architecture Overview
+## How It Works
 
-The upgrade agent orchestrates the upgrade using specialized tools through these steps:
+The upgrade agent orchestrates a **chained workflow** — all tools are called sequentially, sharing a single `analysis_id` generated in the planning step. You provide a single prompt to start the upgrade, and the agent handles the entire process:
 
-1. **Planning**: Analyzes project structure and generates upgrade plans
-2. **Compile and Build**: Updates build environment, dependencies, and fixes build failures
-3. **Spark Code Edit Tools**: Applies targeted code updates for version compatibility
-4. **Execute & Validation**: Submits remote validation jobs to EMR and monitors execution
-5. **Observability**: Tracks upgrade progress and provides status updates
+1. **Planning** — Analyzes project structure, identifies dependencies, and generates a comprehensive upgrade plan
+2. **Build Configuration** — Updates build files (pom.xml, build.sbt, requirements.txt, etc.) and resolves dependency conflicts
+3. **Environment Setup** — Checks and updates Java or Python environment for the target Spark version
+4. **Build & Test** — Compiles the project, runs local tests, and iteratively fixes build failures
+5. **Validation Jobs** — Submits the upgraded application to EMR for remote validation and monitors execution
+6. **Data Quality** — Compares output between source and target Spark versions (when enabled)
+7. **Summary** — Generates a comprehensive upgrade report documenting all changes made
 
 ## Available MCP Server
 
@@ -96,225 +103,98 @@ The upgrade agent orchestrates the upgrade using specialized tools through these
 **Authentication:** AWS IAM role assumption via spark-upgrade-profile
 **Timeout:** 180 seconds
 
-Provides comprehensive Spark upgrade tools including:
-- Project analysis and upgrade planning
-- Automated code transformation
-- Build environment updates
-- Dependency resolution
-- Remote EMR job validation
-- Data quality validation
-- Progress tracking and observability
+Provides a set of chained upgrade tools including:
+- Upgrade plan generation and reuse
+- Build configuration and dependency updates
+- Java and Python environment checks
+- Build guidance and failure analysis
+- Remote validation job submission and status monitoring (EMR EC2, EMR Serverless)
+- Data quality comparison between source and target versions
+- Upgrade result tracking and history
 
-## Usage Examples
+## Usage
 
-### Start a Spark Upgrade Project
+The upgrade agent is designed as a **single-prompt workflow**. You describe your upgrade goal, and the agent orchestrates all the steps automatically. You do **not** need to call individual capabilities separately — the tools chain together from a single starting prompt.
 
+### Starting an Upgrade
+
+Provide your current version, target version, and project path. Optionally include your EMR cluster/application ID and S3 staging path:
+
+**PySpark example (EMR on EC2):**
 ```
-"I want to upgrade my PySpark application from Spark 3.3 to 3.5. 
-The project is located at /path/to/my/spark/project.
-Can you help me create an upgrade plan?"
-```
-
-The agent will:
-1. Analyze your project structure
-2. Identify current Spark version and dependencies
-3. Generate a comprehensive upgrade plan
-4. Outline required changes and validation steps
-
-### Automated Code Transformation
-
-```
-"Please apply the automated code transformations for my Spark 3.5 upgrade.
-Fix any API compatibility issues and update deprecated methods."
+"I want to upgrade my PySpark application from EMR 6.10.0 to 7.8.0.
+The project is at /path/to/my/spark/project.
+My EMR cluster is j-1234567890ABC.
+S3 staging path: s3://my-bucket/spark-upgrade/"
 ```
 
-The agent will:
-1. Scan your codebase for compatibility issues
-2. Apply automated code transformations
-3. Update deprecated API calls
-4. Fix build-time and runtime errors
-5. Maintain approval control over all changes
-
-### Build Environment Update
-
+**Scala example (EMR Serverless):**
 ```
-"Update my build configuration and dependencies for Spark 3.5.
-My project uses Maven/SBT and has custom dependencies."
+"I need to upgrade my Scala Spark application from EMR 6.0.0 to 7.0.0.
+The project is at /path/to/my/scala/project.
+I'm using EMR Serverless, application ID: 00abcdef12345678,
+execution role: arn:aws:iam::123456789012:role/my-emr-serverless-role.
+S3 staging path: s3://my-bucket/spark-upgrade/"
 ```
 
-The agent will:
-1. Update build files (pom.xml, build.sbt, etc.)
-2. Resolve dependency conflicts
-3. Update Spark and related library versions
-4. Compile the project and fix build failures
+### What the Agent Does Automatically
 
-### Remote Validation Testing
+Once you provide the starting prompt, the agent runs through the full workflow:
 
-```
-"Submit a validation job to EMR to test my upgraded application.
-Use my existing EMR cluster j-XXXXX or create a new one with Spark 3.5."
-```
+1. **Generates an upgrade plan** — Scans your project structure, identifies dependencies, detects build system (Maven, SBT, or Python), and creates a step-by-step upgrade plan
+2. **Updates build configuration** — Modifies build files and resolves dependency version conflicts for the target Spark version
+3. **Sets up environment** — Checks and updates your Java or Python environment as needed
+4. **Builds and tests** — Compiles the project, runs local tests if available, and iteratively fixes build failures using failure analysis
+5. **Submits validation jobs** — Packages and submits your application to EMR (EC2 or Serverless) for remote validation
+6. **Monitors execution** — Polls job status until completion, reporting progress
+7. **Validates data quality** — If enabled, runs your job on both source and target Spark versions and compares outputs (schema, row counts, statistical summaries)
+8. **Generates summary** — Produces a comprehensive report of all changes, validation results, and any remaining issues
 
-The agent will:
-1. Package your upgraded application
-2. Submit validation jobs to EMR
-3. Monitor job execution and logs
-4. Report on success/failure and performance
-5. Identify any runtime issues
+You will be asked to review and approve changes at key points throughout the process.
 
-### Data Quality Validation
+## Supported Scenarios
 
-```
-"Validate that my upgraded Spark job produces the same data quality results.
-Compare output between Spark 3.3 and 3.5 versions."
-```
+The upgrade agent works on a **single project** at a time. Provide your project path, current version, and target version.
 
-The agent will:
-1. Run data quality checks on both versions
-2. Compare output datasets
-3. Identify any data discrepancies
-4. Provide detailed validation reports
+**Supported upgrade paths:**
+- PySpark applications (Python) — with pip/requirements.txt, setup.py, pyproject.toml, or Pipfile
+- Scala/Java Spark applications — with Maven (pom.xml) or SBT (build.sbt)
 
-## Common Upgrade Scenarios
+**Supported validation platforms:**
+- Amazon EMR on EC2 (provide cluster ID)
+- Amazon EMR Serverless (provide application ID)
 
-### PySpark Application Upgrade
-
-```
-"I have a PySpark ETL pipeline that processes daily data on EMR.
-Current version: Spark 3.3, Target: Spark 3.5
-Can you help me upgrade and validate it?"
-```
-
-Agent provides:
-- Code compatibility analysis
-- Automated PySpark API updates
-- Dependency resolution
-- EMR job validation
-- Performance comparison
-
-### Scala Spark Application Upgrade
-
-```
-"My Scala Spark streaming application needs to be upgraded from 3.2 to 3.5.
-It uses structured streaming and custom serializers."
-```
-
-Agent handles:
-- Scala API compatibility
-- Structured streaming changes
-- Serialization updates
-- Build configuration updates
-- Streaming job validation
-
-### Multi-Module Project Upgrade
-
-```
-"I have a complex Spark project with multiple modules and shared libraries.
-How should I approach upgrading this to Spark 3.5?"
-```
-
-Agent provides:
-- Module dependency analysis
-- Phased upgrade planning
-- Shared library compatibility
-- Integration testing strategy
-- Coordinated validation approach
-
-### EMR Serverless Migration with Upgrade
-
-```
-"I want to upgrade my Spark application and migrate from EMR on EC2 to EMR Serverless.
-What's the best approach for this dual migration?"
-```
-
-Agent assists with:
-- Platform-specific considerations
-- Spark version compatibility
-- Resource configuration changes
-- Code modifications for serverless
-- Validation on both platforms
+**Note:** For complex projects with multiple modules or shared libraries, consider upgrading each module separately as individual projects.
 
 ## Best Practices
 
-### ✅ Do:
-
-- **Start with analysis** - Let the agent analyze your project first
-- **Review all changes** - Approve each automated transformation
-- **Test incrementally** - Validate changes step by step
-- **Use staging environment** - Test on non-production EMR clusters first
-- **Backup your code** - Commit changes to version control
-- **Monitor validation jobs** - Watch EMR job execution closely
-- **Validate data quality** - Ensure output correctness
-- **Document the process** - Keep track of changes made
-- **Plan for rollback** - Have a way to revert if needed
-- **Engage early** - Start upgrade planning well in advance
-
-### ❌ Don't:
-
-- **Skip project analysis** - Always let the agent analyze first
-- **Auto-approve all changes** - Review each transformation
-- **Rush the process** - Take time to validate each step
-- **Ignore build failures** - Fix compilation issues before proceeding
-- **Skip validation testing** - Always test on EMR before production
-- **Ignore data quality** - Validate output correctness
-- **Forget dependencies** - Check all third-party libraries
-- **Skip documentation** - Document your upgrade process
-- **Ignore warnings** - Address compatibility warnings
-- **Upgrade production directly** - Always test in staging first
+- **Review changes before approving** — The agent will propose code and build file modifications. Read the diffs before accepting them.
+- **Use a non-production EMR cluster with sample data** — Point validation jobs at a staging cluster, not your production environment. Use sample mock datasets that represent your production data but are smaller in size.
+- **Check third-party dependencies** — The agent updates Spark and related libraries, but verify that your other dependencies (e.g., custom JARs, internal libraries) are compatible with the target Spark version.
+- **Enable data quality validation** — If your job writes output data, enable the data quality check to compare results between source and target Spark versions.
 
 ## Troubleshooting
 
+The upgrade agent has **self-healing capability** — when it encounters build failures, code issues, or validation errors, it iteratively analyzes the failure and applies fixes automatically. The scenarios below are expected parts of the upgrade process, not terminal errors.
+
 ### "Project analysis failed"
 **Cause:** Unable to access or parse project structure
-**Solution:**
-- Verify project path is correct and accessible
-- Ensure project has valid build files (pom.xml, build.sbt, etc.)
-- Check file permissions
-- Provide more specific project information
+**Note:** This is the only scenario that requires user action — verify that the project path is correct, accessible, and contains valid build files (pom.xml, build.sbt, requirements.txt, etc.).
 
-### "Code transformation failed"
-**Cause:** Complex code patterns that require manual intervention
-**Solution:**
-- Review the specific transformation error
-- Apply manual fixes for complex cases
-- Break down large transformations into smaller steps
-- Consult Spark migration guides for specific patterns
+### Build failures, code errors, and validation failures
+**These are expected.** The agent will automatically:
+1. Analyze the failure using the upgrade tools
+2. Identify the root cause and relevant Spark migration rules
+3. Apply targeted fixes to your code or build configuration
+4. Re-build and re-test iteratively until the issue is resolved
 
-### "Build compilation failed"
-**Cause:** Dependency conflicts or incompatible versions
-**Solution:**
-- Review dependency version matrix
-- Update conflicting libraries
-- Check for Spark-specific dependency requirements
-- Consider excluding transitive dependencies
-
-### "EMR validation job failed"
-**Cause:** Runtime errors in upgraded application
-**Solution:**
-- Review EMR job logs for specific errors
-- Check Spark configuration compatibility
-- Verify data input formats and schemas
-- Test with smaller datasets first
-- Apply additional code fixes based on runtime errors
-
-### "Data quality validation failed"
-**Cause:** Output differences between Spark versions
-**Solution:**
-- Review data quality report details
-- Check for behavioral changes in Spark versions
-- Verify input data consistency
-- Adjust validation thresholds if appropriate
-- Investigate specific data discrepancies
+If the agent cannot resolve an issue after multiple attempts, it will surface the problem and ask for your input.
 
 ## Configuration
 
 **Authentication:** AWS IAM role via CloudFormation stack (spark-upgrade-profile)
 
-**Required Permissions:**
-- EMR: `elasticmapreduce:*` (for job submission and monitoring)
-- S3: `s3:GetObject`, `s3:PutObject` (for staging artifacts and logs)
-- IAM: `iam:PassRole` (for EMR job execution)
-- CloudWatch: `logs:*` (for log access and monitoring)
+**Required Permissions:** Managed by the CloudFormation stack deployed during onboarding. See the stack template for the full list of IAM permissions granted.
 
 **Supported Platforms:**
 - Amazon EMR on EC2
@@ -327,20 +207,7 @@ Agent assists with:
 **Supported Build Systems:**
 - Maven (pom.xml)
 - SBT (build.sbt)
-- Gradle (build.gradle)
-
-## Tips
-
-1. **Start with project analysis** - Always begin with "analyze my project"
-2. **Review each transformation** - Don't auto-approve all changes
-3. **Test incrementally** - Validate each step before proceeding
-4. **Use natural language** - Describe your upgrade goals clearly
-5. **Provide context** - Share project structure and requirements
-6. **Monitor validation jobs** - Watch EMR execution closely
-7. **Validate data quality** - Ensure output correctness
-8. **Document changes** - Keep track of modifications
-9. **Plan for rollback** - Have a revert strategy ready
-10. **Engage early** - Start planning upgrades well in advance
+- Python (requirements.txt, setup.py, pyproject.toml, Pipfile, poetry.lock, conda)
 
 ---
 
