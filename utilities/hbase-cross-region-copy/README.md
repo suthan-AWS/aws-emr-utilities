@@ -87,20 +87,156 @@ sudo -u hbase hbase snapshot export \
 
 Increasing the number of mappers can significantly improve throughput for large datasets, depending on your cluster size and available resources. Start with 100-200 mappers and adjust based on your cluster capacity.
 
-## Next Steps After Copy
+## Post-Copy Steps: Importing Snapshots on Destination Cluster
 
-Once the copy is complete, you can:
+After successfully copying snapshots to the destination region, follow these steps to restore your HBase tables on the destination cluster.
 
-1. Launch a new EMR cluster in the destination region
-2. Configure the cluster to use the destination S3 bucket as HBase root directory
-3. Import the snapshot on the new cluster:
+### Prerequisites for Import
+
+1. **Launch destination EMR cluster** with HBase configured to use the destination S3 bucket:
+   ```bash
+   aws emr create-cluster \
+     --name "HBase-Destination-Cluster" \
+     --release-label emr-7.x.x \
+     --applications Name=HBase Name=Hadoop \
+     --instance-type m5.4xlarge \
+     --instance-count 3 \
+     --configurations '[{"Classification":"hbase","Properties":{"hbase.emr.storageMode":"s3"}},{"Classification":"hbase-site","Properties":{"hbase.rootdir":"s3://dest-bucket/hbase/"}}]'
+   ```
+
+2. **SSH to the destination cluster master node**
+
+### Option 1: Automated Import (Recommended)
+
+Use the companion import script to automatically restore all snapshots:
 
 ```bash
-hbase snapshot import \
-  -Dfs.s3a.etag.checksum.enabled=true \
-  -snapshot snap_20260302_151152 \
-  -copy-from s3://dest-bucket-ap-south-1/hbase/ \
-  -copy-to s3://dest-bucket-ap-south-1/hbase/
+./hbase-import-snapshots.sh <dest_cluster_master> <snapshot_name> [ssh_key]
+```
+
+**Example:**
+```bash
+./hbase-import-snapshots.sh \
+  ec2-13-127-73-255.ap-south-1.compute.amazonaws.com \
+  snap_20260302_151152 \
+  ~/.ssh/my-emr-key.pem
+```
+
+The script will:
+1. List available snapshots on the destination cluster
+2. Clone the snapshot to restore the table
+3. Verify the table is accessible
+4. Display table row count
+
+### Option 2: Manual Import Steps
+
+If you prefer manual control, follow these steps on the destination cluster:
+
+**1. List available snapshots:**
+```bash
+echo "list_snapshots" | hbase shell
+```
+
+**2. Clone the snapshot to restore the table:**
+```bash
+echo "clone_snapshot 'snap_20260302_151152', 'restored_table_name'" | hbase shell
+```
+
+Or restore to the original table name:
+```bash
+echo "restore_snapshot 'snap_20260302_151152'" | hbase shell
+```
+
+**3. Verify the table:**
+```bash
+echo "list" | hbase shell
+echo "count 'restored_table_name', INTERVAL => 10000" | hbase shell
+```
+
+**4. Enable the table (if needed):**
+```bash
+echo "enable 'restored_table_name'" | hbase shell
+```
+
+### Importing Multiple Tables
+
+If you have multiple snapshots to import:
+
+**1. List all snapshots:**
+```bash
+echo "list_snapshots" | hbase shell
+```
+
+**2. Create a script to import all:**
+```bash
+#!/bin/bash
+SNAPSHOTS=("snap_table1_20260302" "snap_table2_20260302" "snap_table3_20260302")
+
+for snap in "${SNAPSHOTS[@]}"; do
+  echo "Restoring $snap..."
+  echo "restore_snapshot '$snap'" | hbase shell
+done
+```
+
+### Verification Steps
+
+After importing, verify your data:
+
+**1. Check table exists:**
+```bash
+echo "exists 'table_name'" | hbase shell
+```
+
+**2. Verify row count:**
+```bash
+echo "count 'table_name', INTERVAL => 10000" | hbase shell
+```
+
+**3. Sample data:**
+```bash
+echo "scan 'table_name', {LIMIT => 10}" | hbase shell
+```
+
+**4. Compare with source cluster:**
+```bash
+# On source cluster
+echo "count 'table_name'" | hbase shell
+
+# On destination cluster  
+echo "count 'table_name'" | hbase shell
+```
+
+### Complete Workflow Example
+
+Here's a complete end-to-end workflow:
+
+**On Source Cluster:**
+```bash
+# 1. List tables
+echo "list" | hbase shell
+
+# 2. Create snapshots for all tables
+echo "snapshot 'my_table', 'snap_my_table_20260302'" | hbase shell
+
+# 3. Copy to destination region
+./hbase-cross-region-copy.sh \
+  ec2-source.compute-1.amazonaws.com \
+  s3://source-bucket/hbase/ \
+  s3://dest-bucket/hbase/ \
+  snap_my_table_20260302 \
+  ~/.ssh/source-key.pem
+```
+
+**On Destination Cluster:**
+```bash
+# 4. Import snapshot
+./hbase-import-snapshots.sh \
+  ec2-dest.ap-south-1.compute.amazonaws.com \
+  snap_my_table_20260302 \
+  ~/.ssh/dest-key.pem
+
+# 5. Verify data
+echo "count 'my_table'" | hbase shell
 ```
 
 ## Troubleshooting
