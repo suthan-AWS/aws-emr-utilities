@@ -108,46 +108,62 @@ echo ""
 # Step 2: Export snapshot to destination bucket
 echo "[2/4] Exporting snapshot to destination bucket..."
 echo "This may take several minutes depending on data size..."
+
+# Run export in background and capture output
 ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
-    "sudo -u hbase hbase snapshot export \
+    "sudo -u hbase nohup hbase snapshot export \
     -Dfs.s3a.etag.checksum.enabled=true \
     -snapshot $SNAPSHOT_NAME \
-    -copy-to $DEST_BUCKET_PATH" 2>&1 | tee /tmp/export-output.log
+    -copy-to $DEST_BUCKET_PATH \
+    -mappers 200 > /tmp/export-$SNAPSHOT_NAME.log 2>&1 &"
 
-# Check if export succeeded
-if grep -q "ERROR" /tmp/export-output.log; then
-    echo "ERROR: Export failed. Check /tmp/export-output.log for details"
-    exit 1
-fi
-echo "✓ Export initiated"
+# Wait a moment for job to start
+sleep 5
+
+# Get the YARN application ID
+echo "Waiting for export job to start..."
+for i in {1..30}; do
+    APP_ID=$(ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
+        "yarn application -list 2>&1 | grep ExportSnapshot | tail -1 | awk '{print \$1}'" || echo "")
+    
+    if [ -n "$APP_ID" ]; then
+        echo "✓ Export job started: $APP_ID"
+        break
+    fi
+    
+    if [ $i -eq 30 ]; then
+        echo "ERROR: Export job did not start within expected time"
+        echo "Check logs: ssh to cluster and run: cat /tmp/export-$SNAPSHOT_NAME.log"
+        exit 1
+    fi
+    
+    sleep 2
+done
 echo ""
 
 # Step 3: Monitor export progress
 echo "[3/4] Monitoring export progress..."
-LAST_APP_ID=""
 while true; do
     JOB_STATUS=$(ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
-        "yarn application -list 2>&1 | grep ExportSnapshot | tail -1" || echo "")
+        "yarn application -status $APP_ID 2>&1")
     
-    if [ -z "$JOB_STATUS" ]; then
-        # Check if job completed successfully
-        if [ -n "$LAST_APP_ID" ]; then
-            FINAL_STATE=$(ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
-                "yarn application -status $LAST_APP_ID 2>&1 | grep 'Final-State' | awk '{print \$3}'")
-            if [ "$FINAL_STATE" = "SUCCEEDED" ]; then
-                echo "✓ Export job completed successfully"
-            else
-                echo "ERROR: Export job failed with state: $FINAL_STATE"
-                exit 1
-            fi
+    STATE=$(echo "$JOB_STATUS" | grep "State :" | awk '{print $3}')
+    PROGRESS=$(echo "$JOB_STATUS" | grep "Progress :" | awk '{print $3}')
+    
+    if [ "$STATE" = "FINISHED" ] || [ "$STATE" = "FAILED" ] || [ "$STATE" = "KILLED" ]; then
+        FINAL_STATE=$(echo "$JOB_STATUS" | grep "Final-State :" | awk '{print $3}')
+        
+        if [ "$FINAL_STATE" = "SUCCEEDED" ]; then
+            echo "✓ Export job completed successfully (100%)"
+            break
+        else
+            echo "ERROR: Export job failed with state: $FINAL_STATE"
+            echo "Check logs on cluster: cat /tmp/export-$SNAPSHOT_NAME.log"
+            exit 1
         fi
-        break
     fi
     
-    APP_ID=$(echo "$JOB_STATUS" | awk '{print $1}')
-    PROGRESS=$(echo "$JOB_STATUS" | awk '{print $8}')
-    LAST_APP_ID="$APP_ID"
-    echo "Progress: $PROGRESS (Job: $APP_ID)"
+    echo "Progress: $PROGRESS% (State: $STATE)"
     sleep 10
 done
 echo ""
