@@ -69,7 +69,7 @@ If the snapshot `snap_my_table_20260302` doesn't exist, the script will:
 For copying all tables in a cluster at once:
 
 ```bash
-./hbase-cross-region-copy-all-tables.sh <source_cluster_master> <source_bucket_path> <dest_bucket_path> [ssh_key]
+./hbase-cross-region-copy-all-tables.sh <source_cluster_master> <source_bucket_path> <dest_bucket_path> [ssh_key] [--yes]
 ```
 
 This script will:
@@ -78,7 +78,17 @@ This script will:
 3. Export all snapshots to the destination bucket sequentially
 4. Provide a summary of successful and failed exports
 
-#### Example
+#### Arguments
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `source_cluster_master` | EMR master node hostname or IP address | Yes |
+| `source_bucket_path` | S3 path where HBase data currently resides | Yes |
+| `dest_bucket_path` | S3 path where data should be copied | Yes |
+| `ssh_key` | SSH key to access EMR cluster | No (default: ~/.ssh/id_rsa) |
+| `--yes` or `-y` | Skip confirmation prompt for non-interactive execution | No |
+
+#### Example (Interactive)
 
 ```bash
 ./hbase-cross-region-copy-all-tables.sh \
@@ -89,6 +99,19 @@ This script will:
 ```
 
 The script will prompt for confirmation before proceeding with the copy operation.
+
+#### Example (Non-Interactive)
+
+```bash
+./hbase-cross-region-copy-all-tables.sh \
+  ec2-3-85-123-155.compute-1.amazonaws.com \
+  s3://source-bucket-us-east-1/hbase/ \
+  s3://dest-bucket-ap-south-1/hbase/ \
+  ~/.ssh/my-emr-key.pem \
+  --yes
+```
+
+Use the `--yes` flag to skip the confirmation prompt, useful for automation and scripting.
 
 ## How It Works
 
