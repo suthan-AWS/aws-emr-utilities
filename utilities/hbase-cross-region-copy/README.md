@@ -41,8 +41,10 @@ If your use case cannot tolerate write downtime during the snapshot and copy pro
 | `source_cluster_master` | EMR master node hostname or IP address | Yes |
 | `source_bucket_path` | S3 path where HBase data currently resides | Yes |
 | `dest_bucket_path` | S3 path where data should be copied | Yes |
-| `snapshot_name` | Name of the HBase snapshot to copy | Yes |
+| `snapshot_name` | Name of the HBase snapshot to copy (will be created if it doesn't exist) | Yes |
 | `ssh_key` | SSH key to access EMR cluster | No (default: ~/.ssh/id_rsa) |
+
+**Note:** If the snapshot doesn't exist, the script will automatically create it from the table name. The snapshot name should follow the format: `snap_<tablename>_<timestamp>` (e.g., `snap_my_table_20260302`).
 
 ### Example
 
@@ -51,13 +53,20 @@ If your use case cannot tolerate write downtime during the snapshot and copy pro
   ec2-3-85-123-155.compute-1.amazonaws.com \
   s3://source-bucket-us-east-1/hbase/ \
   s3://dest-bucket-ap-south-1/hbase/ \
-  snap_20260302_151152 \
+  snap_my_table_20260302 \
   ~/.ssh/my-emr-key.pem
 ```
+
+If the snapshot `snap_my_table_20260302` doesn't exist, the script will:
+1. Extract the table name (`my_table`)
+2. Create the snapshot from that table
+3. Export it to the destination
 
 ## How It Works
 
 1. **Validation**: Checks if the specified snapshot exists on the source cluster
+   - If snapshot doesn't exist, attempts to create it from the table name
+   - Table name is extracted from snapshot name (format: `snap_<tablename>_<timestamp>`)
 2. **Export**: Initiates HBase snapshot export with ETag checksum enabled
 3. **Monitoring**: Tracks the MapReduce job progress in real-time
 4. **Verification**: Confirms data was successfully copied to the destination

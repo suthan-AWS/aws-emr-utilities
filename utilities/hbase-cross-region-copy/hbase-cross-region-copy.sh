@@ -57,18 +57,52 @@ echo "SSH Key:        $SSH_KEY"
 echo "=========================================="
 echo ""
 
-# Step 1: Check if snapshot exists
+# Step 1: Check if snapshot exists, create if needed
 echo "[1/4] Checking if snapshot exists..."
 SNAPSHOT_EXISTS=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no hadoop@"$SOURCE_CLUSTER_MASTER" \
     "echo \"list_snapshots '$SNAPSHOT_NAME'\" | hbase shell 2>&1 | grep -c '$SNAPSHOT_NAME' || echo 0")
 
 if [ "$SNAPSHOT_EXISTS" -eq 0 ]; then
-    echo "ERROR: Snapshot '$SNAPSHOT_NAME' not found on source cluster"
-    echo "Available snapshots:"
-    ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" "echo 'list_snapshots' | hbase shell 2>&1 | grep -A 100 SNAPSHOT"
-    exit 1
+    echo "Snapshot '$SNAPSHOT_NAME' not found"
+    
+    # Try to extract table name from snapshot name (format: snap_<tablename>_<timestamp>)
+    TABLE_NAME=$(echo "$SNAPSHOT_NAME" | sed 's/^snap_//' | sed 's/_[0-9]*$//')
+    
+    echo "Attempting to create snapshot from table '$TABLE_NAME'..."
+    
+    # Check if table exists
+    TABLE_EXISTS=$(ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
+        "echo \"exists '$TABLE_NAME'\" | hbase shell 2>&1 | grep -c 'does exist' || echo 0")
+    
+    if [ "$TABLE_EXISTS" -eq 0 ]; then
+        echo "ERROR: Table '$TABLE_NAME' not found on source cluster"
+        echo "Available tables:"
+        ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" "echo 'list' | hbase shell 2>&1 | grep -A 100 TABLE"
+        echo ""
+        echo "Please either:"
+        echo "  1. Provide an existing snapshot name, or"
+        echo "  2. Ensure the snapshot name follows format: snap_<tablename>_<timestamp>"
+        exit 1
+    fi
+    
+    # Create snapshot
+    echo "Creating snapshot '$SNAPSHOT_NAME' from table '$TABLE_NAME'..."
+    ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
+        "echo \"snapshot '$TABLE_NAME', '$SNAPSHOT_NAME'\" | hbase shell" > /dev/null 2>&1
+    
+    # Verify snapshot was created
+    SNAPSHOT_CHECK=$(ssh -i "$SSH_KEY" hadoop@"$SOURCE_CLUSTER_MASTER" \
+        "echo \"list_snapshots '$SNAPSHOT_NAME'\" | hbase shell 2>&1 | grep -c '$SNAPSHOT_NAME' || echo 0")
+    
+    if [ "$SNAPSHOT_CHECK" -eq 0 ]; then
+        echo "ERROR: Failed to create snapshot"
+        exit 1
+    fi
+    
+    echo "✓ Snapshot created successfully"
+else
+    echo "✓ Snapshot exists"
 fi
-echo "✓ Snapshot exists"
 echo ""
 
 # Step 2: Export snapshot to destination bucket
