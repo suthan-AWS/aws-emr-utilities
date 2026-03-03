@@ -22,6 +22,12 @@ This script automates the process of copying HBase snapshots between AWS regions
 - AWS CLI configured with appropriate permissions
 - IAM permissions for S3 operations on both source and destination buckets
 
+**IMPORTANT: Write Downtime Requirement**
+
+All HBase writes to the source cluster must be stopped before taking the snapshot. Any writes that occur after the snapshot is taken will NOT be included in the copy and will be lost in the destination cluster.
+
+If your use case cannot tolerate write downtime during the snapshot and copy process, please contact AWS Support to discuss alternative replication solutions.
+
 ## Usage
 
 ```bash
