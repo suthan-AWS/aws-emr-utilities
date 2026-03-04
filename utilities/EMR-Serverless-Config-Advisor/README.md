@@ -232,15 +232,15 @@ tail -f pipeline.log
 
 ### CSV Summary
 ```csv
-application_id,application_name,input_gb,shuffle_ratio,worker_type,vcpu,memory_gb,max_executors,shuffle_partitions,auto_tuned,total_vcpu
-app_001,data-processing-batch,20873.32,46.18,Large,16,108,191,4938,True,3056
-app_002,etl-pipeline,12.14,16601.48,Large,16,108,22,1008,True,352
+application_id,application_name,input_gb,shuffle_ratio,worker_type,vcpu,memory_gb,max_executors,shuffle_partitions
+app_20260301_143022_001,data-processing-batch,20873.32,46.18,Large,16,108,191,4938
+app_20260302_081234_008,etl-incremental-job,12.14,16601.48,Large,16,108,22,1008
 ```
 
 ### JSON Recommendation (excerpt)
 ```json
 {
-  "application_id": "app_001",
+  "application_id": "app_20260301_143022_001",
   "application_name": "data-processing-batch",
   "metrics": {
     "input_gb": 20873.32,
