@@ -29,18 +29,28 @@ from threading import Lock
 from datetime import datetime
 from collections import defaultdict
 import zstandard as zstd
-import boto3
 from io import BytesIO
 
+# Try to import boto3 (optional for local-only usage)
+try:
+    import boto3
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
+    print("Warning: boto3 not available - S3 support disabled")
 
-# Configuration
-INPUT_BUCKET = "suthan-event-logs"
-INPUT_PREFIX = "sample-10-apps/"
-OUTPUT_BUCKET = "suthan-event-logs"
-OUTPUT_PREFIX = "sample-staging/"
+
+# Configuration (can be overridden via command-line or environment)
+INPUT_PATH = "/Users/suthan/Downloads/eventlog_v2_00g3h5dbt06ip80b/"  # or local: "/path/to/logs/"
+OUTPUT_PATH = "/Users/suthan/test_pipeline_full/"  # or local: "/path/to/output/"
 AWS_PROFILE = None
 MAX_WORKERS = 20
 WRITE_WORKERS = 20
+
+
+def is_s3_path(path: str) -> bool:
+    """Check if path is S3."""
+    return path.startswith('s3://')
 
 # Complete config keys list (113 keys)
 print("Loading 113 Spark configuration keys...")
@@ -156,8 +166,24 @@ CONFIG_KEYS = [
 
 # Helper functions
 def get_s3_client(profile=None):
+    if not S3_AVAILABLE:
+        raise RuntimeError("boto3 required for S3 operations")
     session = boto3.Session(profile_name=profile) if profile else boto3.Session()
     return session.client('s3', region_name='us-east-1')
+
+
+def list_files(path: str, profile=None) -> List[str]:
+    """List files from S3 or local filesystem."""
+    if is_s3_path(path):
+        bucket, prefix = path.replace('s3://', '').split('/', 1)
+        return list_s3_files(bucket, prefix, profile)
+    else:
+        # Local filesystem
+        import glob
+        pattern = f"{path}/**/*"
+        all_files = glob.glob(pattern, recursive=True)
+        # Filter out directories
+        return [f for f in all_files if os.path.isfile(f)]
 
 
 def list_s3_files(bucket: str, prefix: str, profile=None) -> List[str]:
@@ -232,6 +258,44 @@ def extract_from_zip(content: bytes, filename: str) -> List[str]:
     except Exception as e:
         print(f"Error extracting zip {filename}: {e}", file=sys.stderr)
     return all_lines
+
+
+def read_file_lines(path: str, file_key: str = None, profile=None) -> List[str]:
+    """Read file from S3 or local filesystem."""
+    if is_s3_path(path):
+        bucket = path.replace('s3://', '').split('/')[0]
+        return read_s3_file_lines(bucket, file_key, profile)
+    else:
+        # Local file
+        file_path = file_key if file_key else path
+        return read_local_file_lines(file_path)
+
+
+def read_local_file_lines(file_path: str) -> List[str]:
+    """Read and decompress local file."""
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        
+        if '.tar' in file_path.lower():
+            return extract_from_tar(content, file_path)
+        elif file_path.endswith('.zip'):
+            return extract_from_zip(content, file_path)
+        else:
+            decompressed = decompress_content(content, file_path)
+            if not decompressed:
+                print(f"Warning: Empty decompressed content for {file_path}", file=sys.stderr)
+                return []
+            text = decompressed.decode('utf-8', errors='ignore')
+            lines = text.splitlines()
+            if len(lines) == 0:
+                print(f"Warning: No lines found after decompression for {file_path}", file=sys.stderr)
+            return lines
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return []
 
 
 def read_s3_file_lines(bucket: str, key: str, profile=None) -> List[str]:
@@ -3904,20 +3968,20 @@ def extract_spark_config(events: List[Dict]) -> Dict[str, Any]:
 
 def process_application(args_tuple: Tuple[str, List[str], str]) -> Tuple[str, Dict, Dict]:
     """Process all files for a single application and extract metrics"""
-    bucket, file_keys, profile = args_tuple
+    input_path, file_keys, profile = args_tuple
     
     # Get application name from first file
     log_name = get_log_name(file_keys[0])
     
     # Read and aggregate events from ALL files for this application
-    # Use ThreadPoolExecutor for parallel S3 reads within the application
+    # Use ThreadPoolExecutor for parallel reads within the application
     all_events = []
     
     if len(file_keys) > 1:
         # Parallel read for applications with multiple files (rolling logs)
         with ThreadPoolExecutor(max_workers=min(10, len(file_keys))) as executor:
             future_to_key = {
-                executor.submit(read_s3_file_lines, bucket, key, profile): key 
+                executor.submit(read_file_lines, input_path, key, profile): key 
                 for key in file_keys
             }
             
@@ -3931,7 +3995,7 @@ def process_application(args_tuple: Tuple[str, List[str], str]) -> Tuple[str, Di
                     print(f"Error reading {key}: {e}", file=sys.stderr)
     else:
         # Single file - read directly
-        lines = read_s3_file_lines(bucket, file_keys[0], profile)
+        lines = read_file_lines(input_path, file_keys[0], profile)
         events = parse_events(lines)
         all_events.extend(events)
     
@@ -4025,6 +4089,37 @@ def get_log_name(s3_key: str) -> str:
     return filename
 
 
+def write_results(output_path: str, log_name: str, 
+                  task_stage_data: Dict, config_data: Dict, profile=None) -> Tuple[str, str]:
+    """Write results to S3 or local filesystem."""
+    if is_s3_path(output_path):
+        bucket, prefix = output_path.replace('s3://', '').split('/', 1)
+        return write_results_to_s3(bucket, prefix, log_name, task_stage_data, config_data, profile)
+    else:
+        return write_results_to_local(output_path, log_name, task_stage_data, config_data)
+
+
+def write_results_to_local(output_path: str, log_name: str,
+                           task_stage_data: Dict, config_data: Dict) -> Tuple[str, str]:
+    """Write results to local filesystem."""
+    from pathlib import Path
+    
+    output_dir = Path(output_path)
+    task_stage_dir = output_dir / "task_stage_summary"
+    config_dir = output_dir / "spark_config_extract"
+    
+    task_stage_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    
+    task_stage_file = task_stage_dir / f"{log_name}.json"
+    config_file = config_dir / f"{log_name}.json"
+    
+    task_stage_file.write_text(json.dumps(task_stage_data, indent=2))
+    config_file.write_text(json.dumps(config_data, indent=2))
+    
+    return str(task_stage_file), str(config_file)
+
+
 def write_results_to_s3(bucket: str, prefix: str, log_name: str, 
                         task_stage_data: Dict, config_data: Dict, profile=None) -> Tuple[str, str]:
     s3_client = get_s3_client(profile)
@@ -4058,13 +4153,17 @@ if __name__ == "__main__":
     print("REDUCED MULTI-THREADED SPARK EVENT LOG PROCESSOR")
     print(f"{'='*80}\n")
     
-    print(f"Scanning S3: s3://{INPUT_BUCKET}/{INPUT_PREFIX}")
-    files = list_s3_files(INPUT_BUCKET, INPUT_PREFIX, AWS_PROFILE)
+    print(f"Scanning: {INPUT_PATH}")
+    files = list_files(INPUT_PATH, AWS_PROFILE)
 
     print(f"\nFound {len(files)} files")
     print("\nSample files:")
     for f in files[:5]:
-        print(f"  s3://{INPUT_BUCKET}/{f}")
+        if is_s3_path(INPUT_PATH):
+            bucket = INPUT_PATH.replace('s3://', '').split('/')[0]
+            print(f"  s3://{bucket}/{f}")
+        else:
+            print(f"  {f}")
     if len(files) > 5:
         print(f"  ... and {len(files) - 5} more")
 
@@ -4109,7 +4208,7 @@ if __name__ == "__main__":
             future_to_app = {
                 process_executor.submit(
                     process_application, 
-                    (INPUT_BUCKET, file_list, AWS_PROFILE)
+                    (INPUT_PATH, file_list, AWS_PROFILE)
                 ): app_name
                 for app_name, file_list in files_by_app.items()
             }
@@ -4134,9 +4233,8 @@ if __name__ == "__main__":
                                 results_by_log[log_name] = (task_stage_data, config_data)
                                 
                                 write_future = write_executor.submit(
-                                    write_results_to_s3,
-                                    OUTPUT_BUCKET,
-                                    OUTPUT_PREFIX,
+                                    write_results,
+                                    OUTPUT_PATH,
                                     log_name,
                                     task_stage_data,
                                     config_data,
@@ -4168,7 +4266,7 @@ if __name__ == "__main__":
             if len(future_to_app) > 0:
                 print(f"\n⚠️  WARNING: {len(future_to_app)} applications still processing after timeout")
             
-            print(f"\nWaiting for {len(write_futures)} S3 writes to complete...")
+            print(f"\nWaiting for {len(write_futures)} writes to complete...")
             for i, (write_future, log_name) in enumerate(write_futures):
                 try:
                     if write_future.done():
@@ -4187,6 +4285,11 @@ if __name__ == "__main__":
     print(f"Processing complete in: {end_time - process_start_time}")
     print(f"Successfully processed {total_processed} applications")
     print(f"\nOutput locations:")
-    print(f"  Task/Stage: s3://{OUTPUT_BUCKET}/{OUTPUT_PREFIX}task_stage_summary/")
-    print(f"  Configs:    s3://{OUTPUT_BUCKET}/{OUTPUT_PREFIX}spark_config_extract/")
+    if is_s3_path(OUTPUT_PATH):
+        bucket, prefix = OUTPUT_PATH.replace('s3://', '').split('/', 1)
+        print(f"  Task/Stage: s3://{bucket}/{prefix}task_stage_summary/")
+        print(f"  Configs:    s3://{bucket}/{prefix}spark_config_extract/")
+    else:
+        print(f"  Task/Stage: {OUTPUT_PATH}/task_stage_summary/")
+        print(f"  Configs:    {OUTPUT_PATH}/spark_config_extract/")
     print(f"{'='*80}\n")

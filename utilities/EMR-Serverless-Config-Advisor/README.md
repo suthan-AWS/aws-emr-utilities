@@ -35,7 +35,7 @@ This utility processes Spark event logs to extract performance metrics and autom
 │                    PIPELINE WORKFLOW                         │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  S3 Event Logs                                              │
+│  Event Logs (S3 or Local)                                   │
 │       │                                                      │
 │       ▼                                                      │
 │  ┌──────────────────────────────────────┐                  │
@@ -43,21 +43,25 @@ This utility processes Spark event logs to extract performance metrics and autom
 │  │  - Discover & group event logs       │                  │
 │  │  - Extract 18 metrics per app        │                  │
 │  │  - Parallel processing (20 workers)  │                  │
-│  │  - Output: JSON metrics to S3        │                  │
+│  │  - Output: JSON metrics (S3/Local)   │                  │
 │  └──────────────────────────────────────┘                  │
 │       │                                                      │
 │       ▼                                                      │
 │  ┌──────────────────────────────────────┐                  │
 │  │  STAGE 2: emr_recommender.py         │                  │
-│  │  - Load metrics from S3              │                  │
+│  │  - Load metrics (S3 or Local)        │                  │
+│  │  - Dual-mode optimization            │                  │
 │  │  - Calculate worker requirements     │                  │
 │  │  - Optimize shuffle partitions       │                  │
 │  │  - Generate Spark configs            │                  │
-│  │  - Output: JSON + CSV                │                  │
+│  │  - Output: Cost + Perf JSON          │                  │
 │  └──────────────────────────────────────┘                  │
 │       │                                                      │
 │       ▼                                                      │
 │  EMR Serverless Recommendations                             │
+│  - Cost-optimized configs                                   │
+│  - Performance-optimized configs                            │
+│  - Optional: Job config format                              │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -176,34 +180,52 @@ else:
 
 ## Usage
 
-### Option 1: Dual-Mode Recommender (Recommended)
+### Recommended: Dual-Mode Recommender with Local/S3 Support
 
-Generate both cost-optimized and performance-optimized recommendations:
+Generate both cost-optimized and performance-optimized recommendations from local or S3 metrics:
 
 ```bash
-python3 emr_recommender_dual_mode.py \
-  --s3-path s3://YOUR_BUCKET/staging/ \
-  --region us-east-1 \
-  --limit 100
+# Local filesystem
+python3 emr_recommender.py \
+  --input-path /path/to/metrics/ \
+  --output-cost recommendations_cost.json \
+  --output-perf recommendations_perf.json
+
+# S3 path
+python3 emr_recommender.py \
+  --input-path s3://YOUR_BUCKET/staging/ \
+  --output-cost recommendations_cost.json \
+  --output-perf recommendations_perf.json
 ```
 
-**Output:**
-- `recommendations_cost_optimized.json` - Conservative executor allocation
-- `recommendations_performance_optimized.json` - Aggressive scaling for high-memory jobs
-- Comparison summary showing differences
+**Features:**
+- Works with both local filesystem and S3 paths
+- No S3 credentials needed for local files
+- Generates both cost and performance recommendations
+- Optional job config format output
+- Configurable shuffle partition size
+
+**Parameters:**
+- `--input-path`: Local directory or S3 path (s3://bucket/prefix) - **required**
+- `--output-cost`: Output file for cost-optimized recommendations
+- `--output-perf`: Output file for performance-optimized recommendations
+- `--limit`: Max applications to process (default: 100)
+- `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
+- `--format-job-config`: Generate deployment-ready job configs
+- `--region`: AWS region (only for S3 paths)
 
 **Advanced Options:**
 
 ```bash
 # Custom partition size (smaller = more parallelism)
-python3 emr_recommender_dual_mode.py \
-  --s3-path s3://YOUR_BUCKET/staging/ \
+python3 emr_recommender.py \
+  --input-path s3://YOUR_BUCKET/staging/ \
   --target-partition-size 512 \
   --limit 100
 
 # Generate deployment-ready job configs
-python3 emr_recommender_dual_mode.py \
-  --s3-path s3://YOUR_BUCKET/staging/ \
+python3 emr_recommender.py \
+  --input-path s3://YOUR_BUCKET/staging/ \
   --format-job-config \
   --limit 100
 ```
@@ -219,20 +241,30 @@ python3 emr_recommender_dual_mode.py \
 
 **Example:** With 512 MiB partitions, a job with 1008 partitions becomes 2016 partitions, and executors increase from 22 to 44.
 
-**Parameters:**
-- `--s3-path`: S3 path to staging area (required)
-- `--region`: AWS region (default: us-east-1)
-- `--limit`: Max applications to process (default: 100)
-- `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
-- `--format-job-config`: Output in job configuration format
-- `--output-cost`: Cost-optimized output file
-- `--output-perf`: Performance-optimized output file
-
-### Option 2: Automated Pipeline (Original)
+### Option 2: Automated Pipeline
 
 Run the complete pipeline with a single command:
 
 ```bash
+# Local filesystem
+python3 pipeline_wrapper.py \
+  --input-path /path/to/event-logs/ \
+  --output-path /path/to/output/ \
+  --output recommendations.json \
+  --limit 10 \
+  --target-partition-size 1024 \
+  --format-job-config
+
+# S3 paths
+python3 pipeline_wrapper.py \
+  --input-path s3://YOUR_BUCKET/event-logs/ \
+  --output-path s3://YOUR_BUCKET/staging/ \
+  --output recommendations.json \
+  --limit 10 \
+  --target-partition-size 1024 \
+  --format-job-config
+
+# Legacy S3 format (backward compatible)
 python3 pipeline_wrapper.py \
   --input-bucket YOUR_BUCKET \
   --input-prefix event-logs/ \
@@ -242,18 +274,29 @@ python3 pipeline_wrapper.py \
 ```
 
 **Parameters:**
+- `--input-path`: Local directory or S3 path (s3://bucket/prefix)
+- `--output-path`: Local directory or S3 path for metrics output
+- `--output`: Local filename for recommendations (JSON)
+- `--limit`: Maximum number of applications to process (default: 100)
+- `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
+- `--format-job-config`: Generate deployment-ready job configs
+- `--region`: AWS region (default: us-east-1)
+- `--skip-extraction`: Skip stage 1, use existing metrics
+
+**Legacy S3 Parameters (backward compatible):**
 - `--input-bucket`: S3 bucket containing event logs
 - `--input-prefix`: S3 prefix/folder with event logs
+- `--staging-bucket`: S3 bucket for intermediate JSON
 - `--staging-prefix`: S3 prefix for intermediate JSON files
-- `--output`: Local filename for recommendations (JSON)
-- `--limit`: Maximum number of applications to process (optional)
 
 **Output:**
-- `recommendations.json`: Detailed recommendations with full Spark configs
-- `recommendations.csv`: Summary table (app name, worker type, executors, etc.)
-- S3 staging area: Intermediate JSON metrics
+- `recommendations_cost.json`: Cost-optimized recommendations
+- `recommendations_perf.json`: Performance-optimized recommendations
+- `recommendations_cost_job_config.json`: Deployment-ready cost configs (if --format-job-config)
+- `recommendations_perf_job_config.json`: Deployment-ready perf configs (if --format-job-config)
+- Metrics directory: Intermediate JSON metrics (task_stage_summary/, spark_config_extract/)
 
-### Option 2: Manual Two-Stage Process
+### Option 3: Manual Two-Stage Process
 
 **Stage 1: Extract Metrics**
 

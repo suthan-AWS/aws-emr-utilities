@@ -19,7 +19,7 @@ from pathlib import Path
 
 # Pipeline configuration
 SPARK_PROCESSOR_SCRIPT = "spark_processor.py"
-RECOMMENDER_SCRIPT = "emr_recommender_v16_s3.py"
+RECOMMENDER_SCRIPT = "emr_recommender.py"
 
 # Default S3 locations
 DEFAULT_INPUT_BUCKET = "suthan-event-logs"
@@ -56,7 +56,7 @@ def run_command(cmd, description):
         return False
 
 
-def update_spark_processor_config(input_bucket, input_prefix, staging_bucket, staging_prefix):
+def update_spark_processor_config(input_path, output_path):
     """Update spark_processor.py configuration dynamically."""
     print(f"\n{'='*80}")
     print("CONFIGURATION: Updating spark_processor.py")
@@ -73,23 +73,13 @@ def update_spark_processor_config(input_bucket, input_prefix, staging_bucket, st
     # Update configuration
     import re
     content = re.sub(
-        r'INPUT_BUCKET = "[^"]*"',
-        f'INPUT_BUCKET = "{input_bucket}"',
+        r'INPUT_PATH = "[^"]*"',
+        f'INPUT_PATH = "{input_path}"',
         content
     )
     content = re.sub(
-        r'INPUT_PREFIX = "[^"]*"',
-        f'INPUT_PREFIX = "{input_prefix}"',
-        content
-    )
-    content = re.sub(
-        r'OUTPUT_BUCKET = "[^"]*"',
-        f'OUTPUT_BUCKET = "{staging_bucket}"',
-        content
-    )
-    content = re.sub(
-        r'OUTPUT_PREFIX = "[^"]*"',
-        f'OUTPUT_PREFIX = "{staging_prefix}"',
+        r'OUTPUT_PATH = "[^"]*"',
+        f'OUTPUT_PATH = "{output_path}"',
         content
     )
     
@@ -98,8 +88,8 @@ def update_spark_processor_config(input_bucket, input_prefix, staging_bucket, st
         f.write(content)
     
     print(f"✓ Updated configuration:")
-    print(f"  INPUT:   s3://{input_bucket}/{input_prefix}")
-    print(f"  OUTPUT:  s3://{staging_bucket}/{staging_prefix}")
+    print(f"  INPUT:   {input_path}")
+    print(f"  OUTPUT:  {output_path}")
     
     return True
 
@@ -109,7 +99,17 @@ def main():
         description="Spark Event Log Processing & EMR Recommendation Pipeline"
     )
     
-    # Input configuration
+    # Unified path arguments (support both local and S3)
+    parser.add_argument(
+        "--input-path",
+        help="Input path: s3://bucket/prefix or /local/path (overrides --input-bucket/prefix)"
+    )
+    parser.add_argument(
+        "--output-path",
+        help="Output path: s3://bucket/prefix or /local/path (overrides --staging-bucket/prefix)"
+    )
+    
+    # Legacy S3-specific arguments (for backward compatibility)
     parser.add_argument(
         "--input-bucket",
         default=DEFAULT_INPUT_BUCKET,
@@ -153,6 +153,17 @@ def main():
         help="AWS region (default: us-east-1)"
     )
     parser.add_argument(
+        "--target-partition-size",
+        type=int,
+        default=1024,
+        help="Target shuffle partition size in MiB (default: 1024)"
+    )
+    parser.add_argument(
+        "--format-job-config",
+        action="store_true",
+        help="Format output to job configuration format"
+    )
+    parser.add_argument(
         "--skip-extraction",
         action="store_true",
         help="Skip extraction step (use existing staging data)"
@@ -160,14 +171,25 @@ def main():
     
     args = parser.parse_args()
     
+    # Resolve paths (unified or legacy)
+    if args.input_path:
+        input_path = args.input_path
+    else:
+        input_path = f"s3://{args.input_bucket}/{args.input_prefix}"
+    
+    if args.output_path:
+        output_path = args.output_path
+    else:
+        output_path = f"s3://{args.staging_bucket}/{args.staging_prefix}"
+    
     print(f"\n{'='*80}")
     print("SPARK EVENT LOG PROCESSING & RECOMMENDATION PIPELINE")
     print(f"{'='*80}")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"\nConfiguration:")
-    print(f"  Input:   s3://{args.input_bucket}/{args.input_prefix}")
-    print(f"  Staging: s3://{args.staging_bucket}/{args.staging_prefix}")
-    print(f"  Output:  {args.output}")
+    print(f"  Input:   {input_path}")
+    print(f"  Output:  {output_path}")
+    print(f"  Results: {args.output}")
     print(f"  Limit:   {args.limit} applications")
     
     pipeline_start = time.time()
@@ -179,12 +201,7 @@ def main():
         print(f"{'='*80}")
         
         # Update spark processor configuration
-        if not update_spark_processor_config(
-            args.input_bucket,
-            args.input_prefix,
-            args.staging_bucket,
-            args.staging_prefix
-        ):
+        if not update_spark_processor_config(input_path, output_path):
             print("\n✗ Pipeline failed: Configuration update failed")
             sys.exit(1)
         
@@ -201,15 +218,21 @@ def main():
     print("STAGE 2: GENERATE EMR SERVERLESS RECOMMENDATIONS")
     print(f"{'='*80}")
     
-    staging_path = f"s3://{args.staging_bucket}/{args.staging_prefix}"
     cmd = [
         "python3",
         RECOMMENDER_SCRIPT,
-        "--s3-path", staging_path,
-        "--region", args.region,
+        "--input-path", output_path,
+        "--output-cost", args.output.replace('.json', '_cost.json'),
+        "--output-perf", args.output.replace('.json', '_perf.json'),
         "--limit", str(args.limit),
-        "--output", args.output
+        "--target-partition-size", str(args.target_partition_size)
     ]
+    
+    if args.region:
+        cmd.extend(["--region", args.region])
+    
+    if args.format_job_config:
+        cmd.append("--format-job-config")
     
     if not run_command(cmd, "Recommendation Generation"):
         print("\n✗ Pipeline failed: Recommendation generation failed")
@@ -222,9 +245,9 @@ def main():
     print(f"{'='*80}")
     print(f"Total time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
     print(f"\nOutputs:")
-    print(f"  Staging JSON: s3://{args.staging_bucket}/{args.staging_prefix}")
-    print(f"  Recommendations: {args.output}")
-    print(f"  CSV Summary: {args.output.replace('.json', '.csv')}")
+    print(f"  Metrics: {output_path}")
+    print(f"  Cost-optimized: {args.output.replace('.json', '_cost.json')}")
+    print(f"  Performance-optimized: {args.output.replace('.json', '_perf.json')}")
     print(f"\n✅ Pipeline completed successfully!\n")
 
 

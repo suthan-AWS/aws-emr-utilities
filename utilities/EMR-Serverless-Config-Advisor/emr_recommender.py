@@ -1,60 +1,92 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-EMR Serverless Recommender v16 (S3 JSON)
-========================================
-Read Spark event–log metrics from JSON files in S3 and produce
-resource / configuration recommendations for EMR Serverless jobs.
-
-Changes in v16:
-- Changed target partition size from 2GB to 1GB
-- Doubles partition count compared to v15
-- Better parallelism for smaller executors
-
-Author: Suthan Phillips <suthan@amazon.com>
+EMR Serverless Recommender - Dual Mode with Local/S3 Support
+Supports both local filesystem and S3 for input/output.
 """
 
-from __future__ import annotations
-
-import argparse
-import json
-import logging
 import sys
+import json
+import glob
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
-
-import boto3
+from typing import List, Dict, Tuple
 import pandas as pd
+import logging
 
-# --------------------------------------------------------------------------- #
-# Logging
-# --------------------------------------------------------------------------- #
-
+# Setup logging
 logging.basicConfig(
     format="%(asctime)s %(levelname)-5s [%(name)s]  %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("ds-recommender")
+log = logging.getLogger("dual-mode-recommender")
 
-# --------------------------------------------------------------------------- #
-# Constants
-# --------------------------------------------------------------------------- #
+# Try to import S3 support
+try:
+    import boto3
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
+    log.warning("boto3 not available - S3 support disabled")
 
-REGION = "us-east-1"
 
-WORKERS = {
-    "Small": {"vcpu": 4, "memory": 27},
-    "Medium": {"vcpu": 8, "memory": 54},
-    "Large": {"vcpu": 16, "memory": 108},
-}
+def is_s3_path(path: str) -> bool:
+    """Check if path is S3."""
+    return path.startswith('s3://')
 
-DEFAULT_PARTITIONS = 1000
-DEFAULT_COALESCE = 25
 
-# --------------------------------------------------------------------------- #
-# Helper functions
-# --------------------------------------------------------------------------- #
+def load_json_files(path: str, limit: int = 100) -> List[Dict]:
+    """Load JSON files from S3 or local filesystem."""
+    all_data = []
+    
+    if is_s3_path(path):
+        if not S3_AVAILABLE:
+            raise RuntimeError("boto3 required for S3 paths. Install: pip install boto3")
+        
+        # S3 path
+        bucket, prefix = path.replace('s3://', '').split('/', 1)
+        prefix = prefix.rstrip('/') + '/task_stage_summary/'
+        
+        s3_client = boto3.client('s3')
+        log.info("Loading from S3: s3://%s/%s", bucket, prefix)
+        
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            if 'Contents' not in page:
+                continue
+            
+            for obj in page['Contents']:
+                key = obj['Key']
+                if not key.endswith('.json'):
+                    continue
+                
+                try:
+                    response = s3_client.get_object(Bucket=bucket, Key=key)
+                    data = json.loads(response['Body'].read())
+                    all_data.append(data)
+                    
+                    if len(all_data) >= limit:
+                        break
+                except Exception as e:
+                    log.debug("Skipping %s: %s", key, e)
+            
+            if len(all_data) >= limit:
+                break
+    else:
+        # Local filesystem
+        search_path = Path(path) / 'task_stage_summary' / '*.json'
+        log.info("Loading from local: %s", search_path)
+        
+        json_files = glob.glob(str(search_path))
+        for json_file in json_files[:limit]:
+            try:
+                with open(json_file) as f:
+                    data = json.load(f)
+                    all_data.append(data)
+            except Exception as e:
+                log.debug("Skipping %s: %s", json_file, e)
+    
+    log.info("Loaded %d JSON files", len(all_data))
+    return all_data
+
 
 def _gb_to_gib(gb: float) -> float:
     return round(gb * 0.931323, 2)
@@ -67,14 +99,12 @@ def _calculate_shuffle_ratio(input_gb, read_gb, write_gb) -> float:
 
 
 def _select_worker_type(input_gb: float, shuffle_ratio: float) -> Tuple[str, Dict]:
-    """
-    V10: Dynamic worker selection based on data volume and shuffle intensity.
+    WORKERS = {
+        "Small": {"vcpu": 4, "memory": 27},
+        "Medium": {"vcpu": 8, "memory": 54},
+        "Large": {"vcpu": 16, "memory": 108},
+    }
     
-    Logic:
-    - Large (16 vCPU, 108 GB): > 2 TB OR shuffle > 70%
-    - Medium (8 vCPU, 54 GB): 500 GB - 2 TB OR shuffle 40-70%
-    - Small (4 vCPU, 27 GB): < 500 GB AND shuffle < 40%
-    """
     if input_gb > 2048 or shuffle_ratio > 70:
         return "Large", WORKERS["Large"]
     elif input_gb > 500 or shuffle_ratio > 40:
@@ -83,27 +113,18 @@ def _select_worker_type(input_gb: float, shuffle_ratio: float) -> Tuple[str, Dic
         return "Small", WORKERS["Small"]
 
 
-def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0, 
-                        mem_pct: float = 60.0, cpu_pct: float = 50.0, 
+def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
+                        mem_pct: float = 60.0, cpu_pct: float = 50.0,
                         idle_pct: float = 50.0, spill_gb: float = 0.0,
                         mode: str = "cost") -> Tuple[int, int]:
-    """
-    Calculate executors using resource pressure.
-    
-    mode: "cost" = conservative (existing logic)
-          "performance" = aggressive for high memory pressure
-    """
-    # Base calculations
     req_input = max(1, int(input_gb / 100))
     req_part = max(1, int((partitions / vcpu) / 3)) if partitions > 0 else 0
     base_req = max(req_input, req_part)
     
     if mode == "performance":
-        # Performance mode: aggressive scaling for high memory
         if mem_pct > 75:
-            factor = 1.0 + ((mem_pct - 75) / 25) * 0.5  # 75-100% → 1.0-1.5x
+            factor = 1.0 + ((mem_pct - 75) / 25) * 0.5
         else:
-            # Standard pressure calculation for lower memory
             mem_pressure = mem_pct * 0.4
             cpu_pressure = cpu_pct * 0.4
             spill_ratio = (spill_gb / max(input_gb, 1)) * 100
@@ -111,7 +132,6 @@ def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
             pressure = max(0, min(100, mem_pressure + cpu_pressure + spill_pressure))
             factor = 0.5 + (pressure / 100) * 1.0
     else:
-        # Cost mode: existing conservative logic
         mem_pressure = mem_pct * 0.4
         cpu_pressure = cpu_pct * 0.4
         spill_ratio = (spill_gb / max(input_gb, 1)) * 100
@@ -125,50 +145,25 @@ def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
     return max_exec, min_exec
 
 
-def _auto_tune_shuffles(worker_type: str, worker_vcpu: int, worker_memory_gb: int, 
-                       shuffle_bytes: float, max_executors: int) -> Tuple[int, int]:
-    """
-    Calculate shuffle partitions based on worker profile and shuffle data size.
-    
-    Logic:
-    1. Calculate effective executor RAM (after 10% overhead)
-    2. Target partition size = 1 GB
-    3. Compute partitions from shuffle bytes
-    4. Round to even number
-    
-    Note: No minimum parallelism constraint since dynamic allocation
-    will scale executors based on actual partition count.
-    """
-    # Step 1: Effective executor RAM after 10% overhead
-    overhead_pct = 0.10
-    effective_mem_gb = worker_memory_gb * (1 - overhead_pct)
-    effective_mem_mib = effective_mem_gb * 1024
-    
-    # Step 2: Target partition size = 1 GB for all worker classes
-    target_mib = 1024  # 1 GB target partition size
-    
-    # Step 3: Compute partitions from shuffle bytes
-    if shuffle_bytes > 0:
-        partitions = int((shuffle_bytes / (target_mib * 1024 * 1024)) + 0.5)  # ceil
-    else:
-        partitions = 200
-    
-    # Step 4: Round to even number
-    if partitions % 2 != 0:
-        partitions += 1
-    
-    return partitions, target_mib
+def _calculate_executor_disk(shuffle_write_gb: float, disk_spill_gb: float,
+                             memory_spill_gb: float, max_executors: int) -> str:
+    total_shuffle_per_exec = shuffle_write_gb / max(max_executors, 1)
+    total_spill_per_exec = (disk_spill_gb + memory_spill_gb) / max(max_executors, 1)
+    estimated_gb = (total_shuffle_per_exec + total_spill_per_exec) * 1.5
+    disk_gb = max(500, min(2000, int(estimated_gb)))
+    return f"{disk_gb}G"
+
+
+def _max_partition_bytes(input_gb: float) -> str:
+    if input_gb >= 1024:
+        return "512m"
+    return "128m"
 
 
 def _get_timeout_configs(input_gb: float, duration_hours: float) -> Dict[str, str]:
     base_timeout = 600
     data_factor = int(input_gb / 1000) * 60
-    
-    if duration_hours and not (duration_hours != duration_hours):
-        duration_factor = int(duration_hours) * 120
-    else:
-        duration_factor = 0
-    
+    duration_factor = int(duration_hours) * 120 if duration_hours else 0
     shuffle_timeout = min(max(base_timeout + data_factor + duration_factor, 600), 1800)
     network_timeout = shuffle_timeout * 2
     
@@ -200,152 +195,115 @@ def _get_iceberg_configs() -> Dict[str, str]:
     }
 
 
-def _max_partition_bytes(input_gb: float) -> str:
-    if input_gb >= 1024:
-        return "512m"
-    return "128m"
-
-
-def _calculate_executor_disk(shuffle_write_gb: float, disk_spill_gb: float, 
-                             memory_spill_gb: float, max_executors: int) -> str:
-    """
-    Calculate executor disk size (500GB - 2000GB) based on shuffle and spill metrics.
-    """
-    # Estimate disk needed per executor
-    total_shuffle_per_exec = shuffle_write_gb / max(max_executors, 1)
-    total_spill_per_exec = (disk_spill_gb + memory_spill_gb) / max(max_executors, 1)
+def generate_dual_recommendations(input_path: str, limit: int = 100,
+                                  target_partition_size_mib: int = 1024) -> Tuple[List[Dict], List[Dict]]:
+    """Generate both cost and performance recommendations."""
     
-    # Add 50% buffer for temporary files
-    estimated_gb = (total_shuffle_per_exec + total_spill_per_exec) * 1.5
+    # Load metrics
+    all_data = load_json_files(input_path, limit)
     
-    # Apply min/max bounds
-    disk_gb = max(500, min(2000, int(estimated_gb)))
+    # Convert to DataFrame
+    flattened = []
+    for data in all_data:
+        # Handle both old format (io/utilization) and new format (io_summary/executor_summary)
+        app_info = data.get('application_info', {})
+        io_data = data.get('io', data.get('io_summary', {}).get('application_level', {}))
+        util_data = data.get('utilization', data.get('executor_summary', {}))
+        spill_data = data.get('spill_summary', {})
+        
+        flat = {
+            'application_id': data.get('application_id', app_info.get('app_id')),
+            'application_name': data.get('application_name', app_info.get('application_name')),
+            'total_run_duration_hours': data.get('total_run_duration_hours', app_info.get('total_run_duration_hours')),
+            'io_total_input_gb': io_data.get('total_input_gb'),
+            'io_total_shuffle_read_gb': io_data.get('total_shuffle_read_gb'),
+            'io_total_shuffle_write_gb': io_data.get('total_shuffle_write_gb'),
+            'avg_memory_utilization_percent': util_data.get('avg_memory_utilization_percent'),
+            'avg_cpu_utilization_percent': util_data.get('avg_cpu_utilization_percent'),
+            'idle_core_percentage': util_data.get('idle_core_percentage'),
+            'total_memory_spilled_gb': spill_data.get('total_memory_spilled_gb'),
+            'total_disk_spilled_gb': spill_data.get('total_disk_spilled_gb'),
+        }
+        flattened.append(flat)
     
-    return f"{disk_gb}G"
-
-
-# --------------------------------------------------------------------------- #
-# Core recommender class
-# --------------------------------------------------------------------------- #
-
-class EmrRecommender:
-    def __init__(self, s3_paths: list[str], region: str = REGION) -> None:
-        self.s3_paths = [p.rstrip('/') for p in s3_paths]
-        self.region = region
-        self.s3_client = boto3.client('s3', region_name=region)
-        log.info("Initialized S3 reader for %d path(s)", len(s3_paths))
-
-    def _load_metrics_from_s3(self, limit: int = 100) -> pd.DataFrame:
-        """Load JSON files from S3 and extract metrics."""
-        all_data = []
+    df = pd.DataFrame(flattened)
+    df = df[df['io_total_input_gb'] > 0]
+    df = df.sort_values('io_total_input_gb', ascending=False).head(limit)
+    
+    log.info("Processing %d applications", len(df))
+    
+    cost_recs = []
+    perf_recs = []
+    
+    for _, row in df.iterrows():
+        app_id = row.get('application_id', 'N/A')
+        name = row.get('application_name', 'N/A')
+        duration = float(row.get('total_run_duration_hours', 0) or 0)
+        i_in_gb = float(row.get('io_total_input_gb', 0) or 0)
+        s_in_gb = float(row.get('io_total_shuffle_read_gb', 0) or 0)
+        s_out_gb = float(row.get('io_total_shuffle_write_gb', 0) or 0)
         
-        for s3_path in self.s3_paths:
-            bucket, prefix = s3_path.replace('s3://', '').split('/', 1)
-            prefix = prefix.rstrip('/') + '/task_stage_summary/'
-            
-            log.info("Listing objects in s3://%s/%s", bucket, prefix)
-            paginator = self.s3_client.get_paginator('list_objects_v2')
-            
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                if 'Contents' not in page:
-                    continue
-                    
-                for obj in page['Contents']:
-                    key = obj['Key']
-                    if not key.endswith('.json'):
-                        continue
-                    
-                    try:
-                        log.debug("Reading s3://%s/%s", bucket, key)
-                        response = self.s3_client.get_object(Bucket=bucket, Key=key)
-                        content = response['Body'].read().decode('utf-8')
-                        data = json.loads(content)
-                        
-                        # Extract executor utilization metrics
-                        exec_summary = data.get('executor_summary', {})
-                        spill_summary = data.get('spill_summary', {})
-                        
-                        # Flatten the structure
-                        flattened = {
-                            'application_id': data.get('application_id'),
-                            'application_name': data.get('application_info', {}).get('application_name'),
-                            'total_run_duration_hours': data.get('total_run_duration_hours'),
-                            'io_total_input_gb': data.get('io_summary', {}).get('application_level', {}).get('total_input_gb', 0),
-                        'io_total_shuffle_read_gb': data.get('io_summary', {}).get('application_level', {}).get('total_shuffle_read_gb', 0),
-                        'io_total_shuffle_write_gb': data.get('io_summary', {}).get('application_level', {}).get('total_shuffle_write_gb', 0),
-                        'avg_memory_utilization_percent': exec_summary.get('avg_memory_utilization_percent', 60.0),
-                        'avg_cpu_utilization_percent': exec_summary.get('avg_cpu_utilization_percent', 50.0),
-                        'idle_core_percentage': exec_summary.get('idle_core_percentage', 50.0),
-                        'total_memory_spilled_gb': spill_summary.get('total_memory_spilled_gb', 0.0),
-                        'total_disk_spilled_gb': spill_summary.get('total_disk_spilled_gb', 0.0),
-                    }
-                        all_data.append(flattened)
-                    except Exception as e:
-                        log.debug("Skipping %s: %s", key, e)
-                        continue
+        mem_pct = float(row.get('avg_memory_utilization_percent', 60.0) or 60.0)
+        cpu_pct = float(row.get('avg_cpu_utilization_percent', 50.0) or 50.0)
+        idle_pct = float(row.get('idle_core_percentage', 50.0) or 50.0)
+        spill_gb = float(row.get('total_memory_spilled_gb', 0.0) or 0.0)
+        disk_spill_gb = float(row.get('total_disk_spilled_gb', 0.0) or 0.0)
         
-        log.info("Loaded %d JSON files from S3", len(all_data))
+        sh_ratio = _calculate_shuffle_ratio(i_in_gb, s_in_gb, s_out_gb)
+        worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio)
         
-        df = pd.DataFrame(all_data)
+        shuffle_data_gb = max(s_in_gb, s_out_gb)
+        shuffle_bytes = shuffle_data_gb * 1024 * 1024 * 1024
         
-        # Filter and sort
-        df = df[df['io_total_input_gb'] > 0]
-        df = df.sort_values('io_total_input_gb', ascending=False).head(limit)
+        # Custom partition calculation
+        def auto_tune_custom(shuffle_bytes, max_executors):
+            target_mib = target_partition_size_mib
+            if shuffle_bytes > 0:
+                partitions = int((shuffle_bytes / (target_mib * 1024 * 1024)) + 0.5)
+            else:
+                partitions = 200
+            if partitions % 2 != 0:
+                partitions += 1
+            return partitions, target_mib
         
-        log.info("Filtered to %d records with input > 0 GB", len(df))
-        return df
-
-    def generate(self, limit: int = 100) -> list[Dict]:
-        df = self._load_metrics_from_s3(limit)
-
-        recommendations = []
-
-        for _, row in df.iterrows():
-            app_id = row.get('application_id', 'N/A')
-            name = row.get('application_name', 'N/A')
-            duration = float(row.get('total_run_duration_hours', 0) or 0)
-            i_in_gb = float(row.get('io_total_input_gb', 0) or 0)
-            s_in_gb = float(row.get('io_total_shuffle_read_gb', 0) or 0)
-            s_out_gb = float(row.get('io_total_shuffle_write_gb', 0) or 0)
-            
-            # Extract utilization metrics
-            mem_pct = float(row.get('avg_memory_utilization_percent', 60.0) or 60.0)
-            cpu_pct = float(row.get('avg_cpu_utilization_percent', 50.0) or 50.0)
-            idle_pct = float(row.get('idle_core_percentage', 50.0) or 50.0)
-            spill_gb = float(row.get('total_memory_spilled_gb', 0.0) or 0.0)
-            disk_spill_gb = float(row.get('total_disk_spilled_gb', 0.0) or 0.0)
-
-            sh_ratio = _calculate_shuffle_ratio(i_in_gb, s_in_gb, s_out_gb)
-
-            worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio)
-            
-            # Calculate shuffle partitions first
-            shuffle_data_gb = max(s_in_gb, s_out_gb)
-            shuffle_bytes = shuffle_data_gb * 1024 * 1024 * 1024
-            
-            # Initial executor limits (will be recalculated after partitions)
-            max_exec_initial, min_exec = _compute_exec_limits(
-                i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb
-            )
-            
-            # Calculate shuffle partitions
-            sp, target_mib = _auto_tune_shuffles(
-                worker_type, 
-                worker_cfg["vcpu"], 
-                worker_cfg["memory"],
-                shuffle_bytes,
-                max_exec_initial
-            )
-            
-            # Recalculate max executors considering partition count
-            max_exec, min_exec = _compute_exec_limits(
-                i_in_gb, worker_cfg["vcpu"], sp, mem_pct, cpu_pct, idle_pct, spill_gb
-            )
-            
-            # Calculate dynamic executor disk size
-            executor_disk = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec)
-
-            spark_cfg = {
+        # Cost-optimized
+        max_exec_cost_init, min_exec_cost = _compute_exec_limits(
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost"
+        )
+        sp_cost, target_mib_cost = auto_tune_custom(shuffle_bytes, max_exec_cost_init)
+        max_exec_cost, min_exec_cost = _compute_exec_limits(
+            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost"
+        )
+        executor_disk_cost = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_cost)
+        
+        # Performance-optimized
+        max_exec_perf_init, min_exec_perf = _compute_exec_limits(
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance"
+        )
+        sp_perf, target_mib_perf = auto_tune_custom(shuffle_bytes, max_exec_perf_init)
+        max_exec_perf, min_exec_perf = _compute_exec_limits(
+            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance"
+        )
+        executor_disk_perf = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_perf)
+        
+        # Build base metrics
+        base_metrics = {
+            "input_gb": round(i_in_gb, 2),
+            "input_gib": _gb_to_gib(i_in_gb),
+            "shuffle_read_gb": round(s_in_gb, 2),
+            "shuffle_write_gb": round(s_out_gb, 2),
+            "shuffle_total_gb": round(s_in_gb + s_out_gb, 2),
+            "shuffle_ratio_percent": sh_ratio,
+            "duration_hours": round(duration, 2),
+            "avg_memory_utilization_percent": round(mem_pct, 2),
+            "avg_cpu_utilization_percent": round(cpu_pct, 2),
+            "idle_core_percentage": round(idle_pct, 2),
+            "total_memory_spilled_gb": round(spill_gb, 2),
+        }
+        
+        # Build Spark configs
+        def build_spark_cfg(max_exec, min_exec, sp, executor_disk):
+            cfg = {
                 "spark.driver.cores": "8",
                 "spark.driver.memory": "54G",
                 "spark.executor.cores": str(worker_cfg["vcpu"]),
@@ -355,172 +313,129 @@ class EmrRecommender:
                 "spark.sql.files.maxPartitionBytes": _max_partition_bytes(i_in_gb),
                 "spark.emr-serverless.executor.disk": executor_disk,
                 "spark.emr-serverless.executor.disk.type": "shuffle_optimized",
+                "spark.sql.shuffle.partitions": str(sp),
+                "spark.dynamicAllocation.maxExecutors": str(max_exec),
+                "spark.dynamicAllocation.minExecutors": str(min_exec),
+                "spark.dynamicAllocation.initialExecutors": str(min_exec),
             }
-            
-            spark_cfg.update(_get_timeout_configs(i_in_gb, duration))
-            spark_cfg.update(_get_s3_retry_configs(i_in_gb))
-            spark_cfg.update(_get_iceberg_configs())
-
-            spark_cfg["spark.sql.shuffle.partitions"] = str(sp)
-
+            cfg.update(_get_timeout_configs(i_in_gb, duration))
+            cfg.update(_get_s3_retry_configs(i_in_gb))
+            cfg.update(_get_iceberg_configs())
             if sh_ratio > 30:
-                spark_cfg.update(
-                    {
-                        "spark.shuffle.compress": "true",
-                        "spark.shuffle.spill.compress": "true",
-                    }
-                )
-
-            spark_cfg["spark.dynamicAllocation.maxExecutors"] = str(max_exec)
-            spark_cfg["spark.dynamicAllocation.minExecutors"] = str(min_exec)
-            spark_cfg["spark.dynamicAllocation.initialExecutors"] = str(min_exec)
-
-            recommendation = {
-                "application_id": app_id,
-                "application_name": name,
-                "metrics": {
-                    "input_gb": round(i_in_gb, 2),
-                    "input_gib": _gb_to_gib(i_in_gb),
-                    "shuffle_read_gb": round(s_in_gb, 2),
-                    "shuffle_write_gb": round(s_out_gb, 2),
-                    "shuffle_total_gb": round(s_in_gb + s_out_gb, 2),
-                    "shuffle_ratio_percent": sh_ratio,
-                    "duration_hours": round(duration, 2),
-                    "avg_memory_utilization_percent": round(mem_pct, 2),
-                    "avg_cpu_utilization_percent": round(cpu_pct, 2),
-                    "idle_core_percentage": round(idle_pct, 2),
-                    "total_memory_spilled_gb": round(spill_gb, 2),
-                },
-                "worker": {
-                    "type": worker_type,
-                    "vcpu": worker_cfg["vcpu"],
-                    "memory_gb": worker_cfg["memory"],
-                    "max_executors": max_exec,
-                    "min_executors": min_exec,
-                    "total_vcpu_capacity": max_exec * worker_cfg["vcpu"],
-                    "total_memory_capacity": max_exec * worker_cfg["memory"],
-                },
-                "spark_configs": spark_cfg,
-                "shuffle_tuned": {
-                    "partitions": sp,
-                    "target_partition_size_mib": target_mib,
-                    "auto_tuned": True,
-                },
-            }
-
-            recommendations.append(recommendation)
-
-        log.info("Generated %d recommendation(s)", len(recommendations))
-        return recommendations
-
-    def persist(self, recs: Iterable[Dict], out_file: Path) -> None:
-        out_file = Path(out_file)
-        out_file.write_text(json.dumps(list(recs), indent=2))
-        log.info("JSON written to %s", out_file)
-
-        csv = out_file.with_suffix(".csv")
-        summary = {
-            "application_id": [],
-            "application_name": [],
-            "input_gb": [],
-            "shuffle_ratio": [],
-            "worker_type": [],
-            "vcpu": [],
-            "memory_gb": [],
-            "max_executors": [],
-            "shuffle_partitions": [],
-            "auto_tuned": [],
-            "total_vcpu": [],
+                cfg.update({"spark.shuffle.compress": "true", "spark.shuffle.spill.compress": "true"})
+            return cfg
+        
+        # Cost recommendation
+        cost_rec = {
+            "application_id": app_id,
+            "application_name": name,
+            "optimization_mode": "cost",
+            "metrics": base_metrics,
+            "worker": {
+                "type": worker_type,
+                "vcpu": worker_cfg["vcpu"],
+                "memory_gb": worker_cfg["memory"],
+                "max_executors": max_exec_cost,
+                "min_executors": min_exec_cost,
+                "total_vcpu_capacity": max_exec_cost * worker_cfg["vcpu"],
+                "total_memory_capacity": max_exec_cost * worker_cfg["memory"],
+            },
+            "spark_configs": build_spark_cfg(max_exec_cost, min_exec_cost, sp_cost, executor_disk_cost),
+            "shuffle_tuned": {
+                "partitions": sp_cost,
+                "target_partition_size_mib": target_mib_cost,
+                "auto_tuned": True,
+            },
         }
-
-        for r in recs:
-            w = r["worker"]
-            ct = r["shuffle_tuned"]
-            summary["application_id"].append(r["application_id"])
-            summary["application_name"].append(r["application_name"])
-            summary["input_gb"].append(r["metrics"]["input_gb"])
-            summary["shuffle_ratio"].append(r["metrics"]["shuffle_ratio_percent"])
-            summary["worker_type"].append(w["type"])
-            summary["vcpu"].append(w["vcpu"])
-            summary["memory_gb"].append(w["memory_gb"])
-            summary["max_executors"].append(w["max_executors"])
-            summary["shuffle_partitions"].append(ct["partitions"])
-            summary["auto_tuned"].append(ct["auto_tuned"])
-            summary["total_vcpu"].append(w["total_vcpu_capacity"])
-        pd.DataFrame(summary).to_csv(csv, index=False)
-        log.info("CSV summary written to %s", csv)
-
-        self._print_tui(recs)
-
-    def _print_tui(self, recs: Iterable[Dict], n: int = 10) -> None:
-        header = (
-            "No | App | InGB | ShRatio% | Worker | Exec | Partitions | Auto"
-        )
-        print("\n" + "=" * 80)
-        print(f"{header}")
-        print("=" * 80)
-
-        for i, r in enumerate(recs[:n], 1):
-            w = r["worker"]
-            c = r["shuffle_tuned"]
-            print(
-                f"{i:>2} | "
-                f"{r['application_name'][:35]:35} | "
-                f"{r['metrics']['input_gb']:>5} | "
-                f"{r['metrics']['shuffle_ratio_percent']:>7.1f} | "
-                f"{w['type']:<6} | "
-                f"{w['max_executors']:>5} | "
-                f"{c['partitions']:<10} | "
-                f"{'✓' if c['auto_tuned'] else ''}"
-            )
-        print("=" * 80, flush=True)
-
-
-# --------------------------------------------------------------------------- #
-# Command‑line frontend
-# --------------------------------------------------------------------------- #
-
-def main(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        "emr-serverless-recommender-s3",
-        description="Generate EMR Serverless configuration recommendations from S3 JSON files.",
-    )
-    parser.add_argument(
-        "--s3-path",
-        required=True,
-        nargs='+',
-        help="S3 path(s) containing JSON files (e.g., s3://bucket/prefix/). Can specify multiple paths.",
-    )
-    parser.add_argument(
-        "--region",
-        default=REGION,
-        help="AWS region",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="How many of the largest jobs to analyze",
-    )
-    parser.add_argument(
-        "--output",
-        default="emr_serverless_recs_v13.json",
-        help="Path to write the JSON + CSV summary",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Turn on verbose logging"
-    )
-    args = parser.parse_args(argv)
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    recommender = EmrRecommender(args.s3_path, args.region)
-    recs = recommender.generate(args.limit)
-    recommender.persist(recs, Path(args.output))
-
-    print("\n✅  Done. Check the output JSON/CSV.\n")
+        
+        # Performance recommendation
+        perf_rec = {
+            "application_id": app_id,
+            "application_name": name,
+            "optimization_mode": "performance",
+            "metrics": base_metrics,
+            "worker": {
+                "type": worker_type,
+                "vcpu": worker_cfg["vcpu"],
+                "memory_gb": worker_cfg["memory"],
+                "max_executors": max_exec_perf,
+                "min_executors": min_exec_perf,
+                "total_vcpu_capacity": max_exec_perf * worker_cfg["vcpu"],
+                "total_memory_capacity": max_exec_perf * worker_cfg["memory"],
+            },
+            "spark_configs": build_spark_cfg(max_exec_perf, min_exec_perf, sp_perf, executor_disk_perf),
+            "shuffle_tuned": {
+                "partitions": sp_perf,
+                "target_partition_size_mib": target_mib_perf,
+                "auto_tuned": True,
+            },
+        }
+        
+        cost_recs.append(cost_rec)
+        perf_recs.append(perf_rec)
+    
+    log.info("Generated %d cost-optimized and %d performance-optimized recommendations",
+             len(cost_recs), len(perf_recs))
+    return cost_recs, perf_recs
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Dual-mode EMR Serverless recommender (S3 or Local)")
+    parser.add_argument("--input-path", required=True, help="S3 path (s3://bucket/prefix) or local path")
+    parser.add_argument("--region", default="us-east-1", help="AWS region (for S3 only)")
+    parser.add_argument("--limit", type=int, default=100, help="Max applications")
+    parser.add_argument("--target-partition-size", type=int, default=1024,
+                        help="Target shuffle partition size in MiB (default: 1024 = 1GB)")
+    parser.add_argument("--output-cost", default="recommendations_cost_optimized.json", help="Cost output file")
+    parser.add_argument("--output-perf", default="recommendations_performance_optimized.json", help="Performance output file")
+    parser.add_argument("--format-job-config", action="store_true",
+                        help="Format output to job configuration format")
+    
+    args = parser.parse_args()
+    
+    # Generate recommendations
+    cost_recs, perf_recs = generate_dual_recommendations(
+        args.input_path,
+        args.limit,
+        args.target_partition_size
+    )
+    
+    # Write cost-optimized
+    Path(args.output_cost).write_text(json.dumps(cost_recs, indent=2))
+    log.info("Cost-optimized recommendations written to %s", args.output_cost)
+    
+    # Write performance-optimized
+    Path(args.output_perf).write_text(json.dumps(perf_recs, indent=2))
+    log.info("Performance-optimized recommendations written to %s", args.output_perf)
+    
+    # Format to job config if requested
+    if args.format_job_config:
+        from format_to_job_config import format_to_job_config
+        
+        cost_jobs = [format_to_job_config(rec) for rec in cost_recs]
+        perf_jobs = [format_to_job_config(rec) for rec in perf_recs]
+        
+        cost_job_file = args.output_cost.replace('.json', '_job_config.json')
+        perf_job_file = args.output_perf.replace('.json', '_job_config.json')
+        
+        Path(cost_job_file).write_text(json.dumps(cost_jobs, indent=2))
+        Path(perf_job_file).write_text(json.dumps(perf_jobs, indent=2))
+        
+        log.info("Job config format written to %s and %s", cost_job_file, perf_job_file)
+    
+    # Print comparison
+    print("\n" + "="*80)
+    print("COMPARISON SUMMARY")
+    print("="*80)
+    print(f"{'App Name':<40} | {'Mode':<11} | {'Max Exec':>8} | {'Total vCPU':>10}")
+    print("-"*80)
+    for cost, perf in zip(cost_recs[:10], perf_recs[:10]):
+        name = cost['application_name'][:38]
+        print(f"{name:<40} | {'Cost':<11} | {cost['worker']['max_executors']:>8} | {cost['worker']['total_vcpu_capacity']:>10}")
+        print(f"{'':<40} | {'Performance':<11} | {perf['worker']['max_executors']:>8} | {perf['worker']['total_vcpu_capacity']:>10}")
+        diff_exec = perf['worker']['max_executors'] - cost['worker']['max_executors']
+        diff_pct = (diff_exec / cost['worker']['max_executors'] * 100) if cost['worker']['max_executors'] > 0 else 0
+        print(f"{'':<40} | {'Difference':<11} | {diff_exec:>+8} | {diff_pct:>+9.1f}%")
+        print("-"*80)
