@@ -41,8 +41,8 @@ except ImportError:
 
 
 # Configuration (can be overridden via command-line or environment)
-INPUT_PATH = "s3://suthan-event-logs/sample-10-apps/"  # or local: "/path/to/logs/"
-OUTPUT_PATH = "s3://suthan-event-logs/sample-staging/"  # or local: "/path/to/output/"
+INPUT_PATH = "/Users/suthan/Downloads/eventlog_v2_00g3h5dbt06ip80b/"  # or local: "/path/to/logs/"
+OUTPUT_PATH = "/Users/suthan/test_pipeline_full/"  # or local: "/path/to/output/"
 AWS_PROFILE = None
 MAX_WORKERS = 20
 WRITE_WORKERS = 20

@@ -246,13 +246,19 @@ Run the complete pipeline with a single command:
 python3 pipeline_wrapper.py \
   --input-path /path/to/event-logs/ \
   --output-path /path/to/output/ \
-  --output recommendations.json
+  --output recommendations.json \
+  --limit 10 \
+  --target-partition-size 1024 \
+  --format-job-config
 
 # S3 paths
 python3 pipeline_wrapper.py \
   --input-path s3://YOUR_BUCKET/event-logs/ \
   --output-path s3://YOUR_BUCKET/staging/ \
-  --output recommendations.json
+  --output recommendations.json \
+  --limit 10 \
+  --target-partition-size 1024 \
+  --format-job-config
 
 # Legacy S3 format (backward compatible)
 python3 pipeline_wrapper.py \
@@ -264,18 +270,29 @@ python3 pipeline_wrapper.py \
 ```
 
 **Parameters:**
+- `--input-path`: Local directory or S3 path (s3://bucket/prefix)
+- `--output-path`: Local directory or S3 path for metrics output
+- `--output`: Local filename for recommendations (JSON)
+- `--limit`: Maximum number of applications to process (default: 100)
+- `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
+- `--format-job-config`: Generate deployment-ready job configs
+- `--region`: AWS region (default: us-east-1)
+- `--skip-extraction`: Skip stage 1, use existing metrics
+
+**Legacy S3 Parameters (backward compatible):**
 - `--input-bucket`: S3 bucket containing event logs
 - `--input-prefix`: S3 prefix/folder with event logs
+- `--staging-bucket`: S3 bucket for intermediate JSON
 - `--staging-prefix`: S3 prefix for intermediate JSON files
-- `--output`: Local filename for recommendations (JSON)
-- `--limit`: Maximum number of applications to process (optional)
 
 **Output:**
-- `recommendations.json`: Detailed recommendations with full Spark configs
-- `recommendations.csv`: Summary table (app name, worker type, executors, etc.)
-- S3 staging area: Intermediate JSON metrics
+- `recommendations_cost.json`: Cost-optimized recommendations
+- `recommendations_perf.json`: Performance-optimized recommendations
+- `recommendations_cost_job_config.json`: Deployment-ready cost configs (if --format-job-config)
+- `recommendations_perf_job_config.json`: Deployment-ready perf configs (if --format-job-config)
+- Metrics directory: Intermediate JSON metrics (task_stage_summary/, spark_config_extract/)
 
-### Option 2: Manual Two-Stage Process
+### Option 3: Manual Two-Stage Process
 
 **Stage 1: Extract Metrics**
 
