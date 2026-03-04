@@ -85,34 +85,39 @@ def _select_worker_type(input_gb: float, shuffle_ratio: float) -> Tuple[str, Dic
 
 def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0, 
                         mem_pct: float = 60.0, cpu_pct: float = 50.0, 
-                        idle_pct: float = 50.0, spill_gb: float = 0.0) -> Tuple[int, int]:
+                        idle_pct: float = 50.0, spill_gb: float = 0.0,
+                        mode: str = "cost") -> Tuple[int, int]:
     """
-    Calculate executors using resource pressure (v13: fixed logic).
+    Calculate executors using resource pressure.
     
-    High pressure (mem/cpu/spill) = MORE executors needed
-    Low pressure = FEWER executors needed
+    mode: "cost" = conservative (existing logic)
+          "performance" = aggressive for high memory pressure
     """
     # Base calculations
     req_input = max(1, int(input_gb / 100))
     req_part = max(1, int((partitions / vcpu) / 3)) if partitions > 0 else 0
     base_req = max(req_input, req_part)
     
-    # Resource pressure score (0-100)
-    # Higher = more stressed = need MORE executors
-    mem_pressure = mem_pct * 0.4  # 40% weight
-    cpu_pressure = cpu_pct * 0.4  # 40% weight (removed idle redundancy)
-    
-    # Spill pressure: relative to input size (0-20 points)
-    spill_ratio = (spill_gb / max(input_gb, 1)) * 100
-    spill_pressure = min(20, spill_ratio * 0.2)  # 20% weight
-    
-    pressure = mem_pressure + cpu_pressure + spill_pressure
-    pressure = max(0, min(100, pressure))
-    
-    # Scaling factor: 0.5 (low pressure) to 1.5 (high pressure)
-    # Low pressure (underutilized) -> reduce executors (0.5x)
-    # High pressure (overutilized) -> increase executors (1.5x)
-    factor = 0.5 + (pressure / 100) * 1.0  # Range: 0.5 to 1.5
+    if mode == "performance":
+        # Performance mode: aggressive scaling for high memory
+        if mem_pct > 75:
+            factor = 1.0 + ((mem_pct - 75) / 25) * 0.5  # 75-100% → 1.0-1.5x
+        else:
+            # Standard pressure calculation for lower memory
+            mem_pressure = mem_pct * 0.4
+            cpu_pressure = cpu_pct * 0.4
+            spill_ratio = (spill_gb / max(input_gb, 1)) * 100
+            spill_pressure = min(20, spill_ratio * 0.2)
+            pressure = max(0, min(100, mem_pressure + cpu_pressure + spill_pressure))
+            factor = 0.5 + (pressure / 100) * 1.0
+    else:
+        # Cost mode: existing conservative logic
+        mem_pressure = mem_pct * 0.4
+        cpu_pressure = cpu_pct * 0.4
+        spill_ratio = (spill_gb / max(input_gb, 1)) * 100
+        spill_pressure = min(20, spill_ratio * 0.2)
+        pressure = max(0, min(100, mem_pressure + cpu_pressure + spill_pressure))
+        factor = 0.5 + (pressure / 100) * 1.0
     
     max_exec = max(2, int(base_req * factor))
     min_exec = max(1, max_exec // 2)

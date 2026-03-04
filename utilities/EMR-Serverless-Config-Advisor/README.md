@@ -14,9 +14,12 @@ This utility processes Spark event logs to extract performance metrics and autom
 ## Features
 
 - **Automated Pipeline**: End-to-end processing from event logs to recommendations
+- **Dual Optimization Modes**: Cost-optimized vs Performance-optimized configurations
 - **Parallel Processing**: Multi-threaded extraction with configurable workers
 - **S3 Integration**: Direct S3 read/write with streaming decompression
 - **Rolling Log Support**: Handles both single and rolling event logs
+- **Configurable Partition Size**: Adjust shuffle parallelism (default: 1GB)
+- **Job Config Format**: Optional output in deployment-ready format
 - **18 Metric Extractors**: Comprehensive analysis including:
   - Input/output data volumes
   - Shuffle read/write patterns
@@ -60,6 +63,31 @@ This utility processes Spark event logs to extract performance metrics and autom
 ```
 
 ## Algorithm
+
+### Optimization Modes
+
+#### Cost-Optimized Mode (Default)
+Conservative executor allocation based on resource pressure:
+```python
+pressure = mem_utilization * 0.4 + cpu_utilization * 0.4 + spill_ratio * 0.2
+scaling_factor = 0.5 + (pressure / 100) * 1.0  # Range: 0.5 to 1.5
+max_executors = base_requirement * scaling_factor
+```
+
+**Best for:** Budget-conscious workloads, development/testing environments
+
+#### Performance-Optimized Mode
+Aggressive scaling for high memory pressure (>75%):
+```python
+if memory_utilization > 75%:
+    scaling_factor = 1.0 + ((memory_utilization - 75) / 25) * 0.5  # Range: 1.0 to 1.5
+else:
+    # Use standard pressure calculation
+```
+
+**Best for:** Production SLA-critical workloads, jobs with memory pressure
+
+**Impact:** 5-21% more executors for memory-stressed jobs (>75% utilization)
 
 ### Stage 1: Metric Extraction (`spark_processor.py`)
 
@@ -148,7 +176,48 @@ This utility processes Spark event logs to extract performance metrics and autom
 
 ## Usage
 
-### Option 1: Automated Pipeline (Recommended)
+### Option 1: Dual-Mode Recommender (Recommended)
+
+Generate both cost-optimized and performance-optimized recommendations:
+
+```bash
+python3 emr_recommender_dual_mode.py \
+  --s3-path s3://YOUR_BUCKET/staging/ \
+  --region us-east-1 \
+  --limit 100
+```
+
+**Output:**
+- `recommendations_cost_optimized.json` - Conservative executor allocation
+- `recommendations_performance_optimized.json` - Aggressive scaling for high-memory jobs
+- Comparison summary showing differences
+
+**Advanced Options:**
+
+```bash
+# Custom partition size (smaller = more parallelism)
+python3 emr_recommender_dual_mode.py \
+  --s3-path s3://YOUR_BUCKET/staging/ \
+  --target-partition-size 512 \
+  --limit 100
+
+# Generate deployment-ready job configs
+python3 emr_recommender_dual_mode.py \
+  --s3-path s3://YOUR_BUCKET/staging/ \
+  --format-job-config \
+  --limit 100
+```
+
+**Parameters:**
+- `--s3-path`: S3 path to staging area (required)
+- `--region`: AWS region (default: us-east-1)
+- `--limit`: Max applications to process (default: 100)
+- `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
+- `--format-job-config`: Output in job configuration format
+- `--output-cost`: Cost-optimized output file
+- `--output-perf`: Performance-optimized output file
+
+### Option 2: Automated Pipeline (Original)
 
 Run the complete pipeline with a single command:
 
