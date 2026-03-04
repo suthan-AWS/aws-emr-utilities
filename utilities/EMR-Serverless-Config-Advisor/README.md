@@ -345,13 +345,3 @@ Contributions are welcome! Please submit pull requests or open issues for:
 ## License
 
 This utility is licensed under the MIT-0 License. See the LICENSE file.
-
-## Authors
-
-- Suthan Phillips (suthan@amazon.com)
-- Arun Maniyan (amaniyan@amazon.com)
-
-## Acknowledgments
-
-- AWS EMR Serverless team for worker type specifications
-- Apache Spark community for event log format documentation
