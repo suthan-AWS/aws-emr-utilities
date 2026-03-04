@@ -208,6 +208,17 @@ python3 emr_recommender_dual_mode.py \
   --limit 100
 ```
 
+**Partition Size Impact:**
+
+| Size (MiB) | Effect | Use Case |
+|------------|--------|----------|
+| 2048 | Fewer partitions, fewer executors | Large data, less parallelism |
+| 1024 | Default (1 GB per partition) | Balanced (recommended) |
+| 512 | 2x partitions, 2x executors | Shuffle-heavy workloads |
+| 256 | 4x partitions, 4x executors | Extreme parallelism needed |
+
+**Example:** With 512 MiB partitions, a job with 1008 partitions becomes 2016 partitions, and executors increase from 22 to 44.
+
 **Parameters:**
 - `--s3-path`: S3 path to staging area (required)
 - `--region`: AWS region (default: us-east-1)
