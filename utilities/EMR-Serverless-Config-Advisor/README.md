@@ -176,19 +176,19 @@ else:
 
 ## Usage
 
-### Option 1: Local/S3 Dual-Mode Recommender (Recommended for Local Development)
+### Recommended: Dual-Mode Recommender with Local/S3 Support
 
-Generate recommendations from local or S3 metrics files:
+Generate both cost-optimized and performance-optimized recommendations from local or S3 metrics:
 
 ```bash
 # Local filesystem
-python3 emr_recommender_local_s3.py \
+python3 emr_recommender.py \
   --input-path /path/to/metrics/ \
   --output-cost recommendations_cost.json \
   --output-perf recommendations_perf.json
 
 # S3 path
-python3 emr_recommender_local_s3.py \
+python3 emr_recommender.py \
   --input-path s3://YOUR_BUCKET/staging/ \
   --output-cost recommendations_cost.json \
   --output-perf recommendations_perf.json
@@ -199,43 +199,29 @@ python3 emr_recommender_local_s3.py \
 - No S3 credentials needed for local files
 - Generates both cost and performance recommendations
 - Optional job config format output
+- Configurable shuffle partition size
 
 **Parameters:**
-- `--input-path`: Local directory or S3 path (s3://bucket/prefix)
+- `--input-path`: Local directory or S3 path (s3://bucket/prefix) - **required**
 - `--output-cost`: Output file for cost-optimized recommendations
 - `--output-perf`: Output file for performance-optimized recommendations
 - `--limit`: Max applications to process (default: 100)
 - `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
 - `--format-job-config`: Generate deployment-ready job configs
-
-### Option 2: Dual-Mode Recommender (S3 Only)
-
-Generate both cost-optimized and performance-optimized recommendations:
-
-```bash
-python3 emr_recommender_dual_mode.py \
-  --s3-path s3://YOUR_BUCKET/staging/ \
-  --region us-east-1 \
-  --limit 100
-```
-
-**Output:**
-- `recommendations_cost_optimized.json` - Conservative executor allocation
-- `recommendations_performance_optimized.json` - Aggressive scaling for high-memory jobs
-- Comparison summary showing differences
+- `--region`: AWS region (only for S3 paths)
 
 **Advanced Options:**
 
 ```bash
 # Custom partition size (smaller = more parallelism)
-python3 emr_recommender_dual_mode.py \
-  --s3-path s3://YOUR_BUCKET/staging/ \
+python3 emr_recommender.py \
+  --input-path s3://YOUR_BUCKET/staging/ \
   --target-partition-size 512 \
   --limit 100
 
 # Generate deployment-ready job configs
-python3 emr_recommender_dual_mode.py \
-  --s3-path s3://YOUR_BUCKET/staging/ \
+python3 emr_recommender.py \
+  --input-path s3://YOUR_BUCKET/staging/ \
   --format-job-config \
   --limit 100
 ```
@@ -250,15 +236,6 @@ python3 emr_recommender_dual_mode.py \
 | 256 | 4x partitions, 4x executors | Extreme parallelism needed |
 
 **Example:** With 512 MiB partitions, a job with 1008 partitions becomes 2016 partitions, and executors increase from 22 to 44.
-
-**Parameters:**
-- `--s3-path`: S3 path to staging area (required)
-- `--region`: AWS region (default: us-east-1)
-- `--limit`: Max applications to process (default: 100)
-- `--target-partition-size`: Shuffle partition size in MiB (default: 1024)
-- `--format-job-config`: Output in job configuration format
-- `--output-cost`: Cost-optimized output file
-- `--output-perf`: Performance-optimized output file
 
 ### Option 2: Automated Pipeline (Original)
 
