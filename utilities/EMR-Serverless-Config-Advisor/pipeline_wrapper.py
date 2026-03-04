@@ -153,6 +153,17 @@ def main():
         help="AWS region (default: us-east-1)"
     )
     parser.add_argument(
+        "--target-partition-size",
+        type=int,
+        default=1024,
+        help="Target shuffle partition size in MiB (default: 1024)"
+    )
+    parser.add_argument(
+        "--format-job-config",
+        action="store_true",
+        help="Format output to job configuration format"
+    )
+    parser.add_argument(
         "--skip-extraction",
         action="store_true",
         help="Skip extraction step (use existing staging data)"
@@ -213,11 +224,15 @@ def main():
         "--input-path", output_path,
         "--output-cost", args.output.replace('.json', '_cost.json'),
         "--output-perf", args.output.replace('.json', '_perf.json'),
-        "--limit", str(args.limit)
+        "--limit", str(args.limit),
+        "--target-partition-size", str(args.target_partition_size)
     ]
     
     if args.region:
         cmd.extend(["--region", args.region])
+    
+    if args.format_job_config:
+        cmd.append("--format-job-config")
     
     if not run_command(cmd, "Recommendation Generation"):
         print("\n✗ Pipeline failed: Recommendation generation failed")
