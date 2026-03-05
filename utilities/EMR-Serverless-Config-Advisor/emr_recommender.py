@@ -475,6 +475,7 @@ if __name__ == "__main__":
             else:
                 # Write single file
                 cost_job_file = args.output_cost.replace('.json', '_job_config.json')
+                Path(cost_job_file).parent.mkdir(parents=True, exist_ok=True)
                 Path(cost_job_file).write_text(json.dumps(cost_jobs, indent=2))
                 log.info("Cost-optimized job config written to %s", cost_job_file)
         else:
@@ -498,6 +499,7 @@ if __name__ == "__main__":
             else:
                 # Write single file
                 perf_job_file = args.output_perf.replace('.json', '_job_config.json')
+                Path(perf_job_file).parent.mkdir(parents=True, exist_ok=True)
                 Path(perf_job_file).write_text(json.dumps(perf_jobs, indent=2))
                 log.info("Performance-optimized job config written to %s", perf_job_file)
         else:

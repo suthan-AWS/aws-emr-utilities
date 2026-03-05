@@ -164,6 +164,21 @@ def main():
         help="Format output to job configuration format"
     )
     parser.add_argument(
+        "--cost-optimized",
+        action="store_true",
+        help="Generate only cost-optimized recommendations"
+    )
+    parser.add_argument(
+        "--performance-optimized",
+        action="store_true",
+        help="Generate only performance-optimized recommendations"
+    )
+    parser.add_argument(
+        "--individual-files",
+        action="store_true",
+        help="Generate individual JSON files per job (1-jobname.json, 2-jobname.json, ...)"
+    )
+    parser.add_argument(
         "--skip-extraction",
         action="store_true",
         help="Skip extraction step (use existing staging data)"
@@ -233,6 +248,15 @@ def main():
     
     if args.format_job_config:
         cmd.append("--format-job-config")
+    
+    if args.cost_optimized:
+        cmd.append("--cost-optimized")
+    
+    if args.performance_optimized:
+        cmd.append("--performance-optimized")
+    
+    if args.individual_files:
+        cmd.append("--individual-files")
     
     if not run_command(cmd, "Recommendation Generation"):
         print("\n✗ Pipeline failed: Recommendation generation failed")
