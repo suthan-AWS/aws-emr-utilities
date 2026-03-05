@@ -437,6 +437,12 @@ if __name__ == "__main__":
     parser.add_argument("--output-perf", default="recommendations_performance_optimized.json", help="Performance output file")
     parser.add_argument("--format-job-config", action="store_true",
                         help="Format output to job configuration format")
+    parser.add_argument("--cost-optimized", action="store_true",
+                        help="Generate only cost-optimized recommendations")
+    parser.add_argument("--performance-optimized", action="store_true",
+                        help="Generate only performance-optimized recommendations")
+    parser.add_argument("--individual-files", action="store_true",
+                        help="Generate individual JSON files per job (1-jobname.json, 2-jobname.json, ...)")
     
     args = parser.parse_args()
     
@@ -447,33 +453,62 @@ if __name__ == "__main__":
         args.target_partition_size
     )
     
-    # Write cost-optimized
-    Path(args.output_cost).write_text(json.dumps(cost_recs, indent=2))
-    log.info("Cost-optimized recommendations written to %s", args.output_cost)
+    # Determine which recommendations to generate
+    generate_cost = not args.performance_optimized  # Generate cost unless perf-only
+    generate_perf = not args.cost_optimized  # Generate perf unless cost-only
     
-    # Write performance-optimized
-    Path(args.output_perf).write_text(json.dumps(perf_recs, indent=2))
-    log.info("Performance-optimized recommendations written to %s", args.output_perf)
+    # Write recommendations
+    if generate_cost:
+        if args.format_job_config:
+            from format_to_job_config import format_to_job_config
+            cost_jobs = [format_to_job_config(rec) for rec in cost_recs]
+            
+            if args.individual_files:
+                # Write individual files
+                output_dir = Path(args.output_cost).parent
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for i, job in enumerate(cost_jobs, 1):
+                    job_name = job.get('job_name', f'job_{i}').replace(' ', '_').replace('-job', '')
+                    filename = output_dir / f"{i}-{job_name}.json"
+                    filename.write_text(json.dumps(job, indent=2))
+                log.info("Cost-optimized job configs written to %d individual files in %s", len(cost_jobs), output_dir)
+            else:
+                # Write single file
+                cost_job_file = args.output_cost.replace('.json', '_job_config.json')
+                Path(cost_job_file).write_text(json.dumps(cost_jobs, indent=2))
+                log.info("Cost-optimized job config written to %s", cost_job_file)
+        else:
+            Path(args.output_cost).write_text(json.dumps(cost_recs, indent=2))
+            log.info("Cost-optimized recommendations written to %s", args.output_cost)
     
-    # Format to job config if requested
-    if args.format_job_config:
-        from format_to_job_config import format_to_job_config
-        
-        cost_jobs = [format_to_job_config(rec) for rec in cost_recs]
-        perf_jobs = [format_to_job_config(rec) for rec in perf_recs]
-        
-        cost_job_file = args.output_cost.replace('.json', '_job_config.json')
-        perf_job_file = args.output_perf.replace('.json', '_job_config.json')
-        
-        Path(cost_job_file).write_text(json.dumps(cost_jobs, indent=2))
-        Path(perf_job_file).write_text(json.dumps(perf_jobs, indent=2))
-        
-        log.info("Job config format written to %s and %s", cost_job_file, perf_job_file)
+    if generate_perf:
+        if args.format_job_config:
+            from format_to_job_config import format_to_job_config
+            perf_jobs = [format_to_job_config(rec) for rec in perf_recs]
+            
+            if args.individual_files:
+                # Write individual files
+                output_dir = Path(args.output_perf).parent
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for i, job in enumerate(perf_jobs, 1):
+                    job_name = job.get('job_name', f'job_{i}').replace(' ', '_').replace('-job', '')
+                    filename = output_dir / f"{i}-{job_name}.json"
+                    filename.write_text(json.dumps(job, indent=2))
+                log.info("Performance-optimized job configs written to %d individual files", len(perf_jobs))
+            else:
+                # Write single file
+                perf_job_file = args.output_perf.replace('.json', '_job_config.json')
+                Path(perf_job_file).write_text(json.dumps(perf_jobs, indent=2))
+                log.info("Performance-optimized job config written to %s", perf_job_file)
+        else:
+            Path(args.output_perf).write_text(json.dumps(perf_recs, indent=2))
+            log.info("Performance-optimized recommendations written to %s", args.output_perf)
     
-    # Print comparison
-    print("\n" + "="*80)
-    print("COMPARISON SUMMARY")
-    print("="*80)
+    # Print comparison (only if both modes generated)
+    if generate_cost and generate_perf:
+        print("\n" + "="*80)
+        print("COMPARISON SUMMARY")
+        print("="*80)
     print(f"{'App Name':<40} | {'Mode':<11} | {'Max Exec':>8} | {'Total vCPU':>10}")
     print("-"*80)
     for cost, perf in zip(cost_recs[:10], perf_recs[:10]):
