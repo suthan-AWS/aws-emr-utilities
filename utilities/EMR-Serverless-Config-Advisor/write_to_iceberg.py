@@ -83,7 +83,7 @@ def write_to_iceberg(recommendations, table_path, region="us-east-1"):
     for i in range(0, len(selects), batch_size):
         batch = selects[i:i + batch_size]
         union_sql = " UNION ALL ".join(batch)
-        insert_sql = f"INSERT INTO `{database}`.`{table}` {union_sql}"
+        insert_sql = f'INSERT INTO "{database}"."{table}" {union_sql}'
         _run_athena_query(athena, insert_sql, database)
         log.info("Inserted batch %d-%d of %d", i + 1, min(i + batch_size, len(selects)), len(selects))
 
