@@ -20,6 +20,7 @@ This utility processes Spark event logs to extract performance metrics and autom
 - **Time-Based Filtering**: Process only recent logs (last 1h, 24h, 1 week, etc.)
 - **Parallel Processing**: Multi-threaded extraction with 20 workers
 - **S3 Integration**: Direct S3 read/write with streaming decompression
+- **Iceberg Table Output**: Write recommendations to Iceberg tables via Athena for historical tracking
 - **Rolling Log Support**: Handles both single and rolling event logs
 - **Configurable Partition Size**: Adjust shuffle parallelism (default: 1GB)
 - **Job Config Format**: Optional output in deployment-ready format
@@ -218,6 +219,7 @@ python3 emr_recommender.py \
 - `--cost-optimized`: Generate only cost-optimized recommendations
 - `--performance-optimized`: Generate only performance-optimized recommendations
 - `--individual-files`: Generate separate JSON per job (1-jobname.json, 2-jobname.json, ...)
+- `--write-to-iceberg-table`: Write recommendations to Iceberg table (format: catalog.database.table)
 - `--region`: AWS region (only for S3 paths)
 
 **Advanced Options:**
@@ -575,7 +577,65 @@ python3 emr_recommender.py \
 
 ---
 
-### 6. Custom Partition Sizing
+### 6. Iceberg Table Output
+
+Write recommendations directly to an Apache Iceberg table via Amazon Athena for historical tracking and querying.
+
+**Prerequisites:**
+- Athena workgroup named `V3` (engine version 3, required for Iceberg DML)
+- Glue database (e.g., `common`) already exists
+- S3 location for Iceberg data
+
+**Usage:**
+
+```bash
+# Write cost-optimized recommendations to Iceberg table
+python3 emr_recommender.py \
+  --input-path s3://bucket/metrics/ \
+  --output-cost cost_recs.json \
+  --cost-optimized \
+  --write-to-iceberg-table AwsDataCatalog.common.emr-serverless-config-advisor
+
+# With pipeline
+python3 pipeline_wrapper.py \
+  --input-path s3://bucket/event-logs/ \
+  --output-path s3://bucket/staging/ \
+  --output recommendations.json \
+  --write-to-iceberg-table AwsDataCatalog.common.emr-serverless-config-advisor
+```
+
+**Table Schema:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| job_id | string | Spark job ID from event log |
+| application_name | string | Spark application name |
+| optimization_mode | string | cost / performance / minimal |
+| recommendation | string | Full job config as JSON |
+| created_at | timestamp | When recommendation was written |
+
+**How it works:**
+- Creates the Iceberg table automatically if it doesn't exist
+- Inserts recommendations in batches of 20 using `INSERT INTO ... SELECT`
+- Uses Athena V3 engine (required for Iceberg DML operations)
+- Table format: `catalog.database.table` (e.g., `AwsDataCatalog.common.my-table`)
+
+**Query recommendations:**
+```sql
+-- Latest recommendations per job
+SELECT * FROM common.`emr-serverless-config-advisor`
+ORDER BY created_at DESC;
+
+-- Cost recommendations only
+SELECT job_id, application_name, recommendation
+FROM common.`emr-serverless-config-advisor`
+WHERE optimization_mode = 'cost'
+ORDER BY created_at DESC;
+```
+
+---
+
+### 7. Custom Partition Sizing
 
 Adjust shuffle partition size for different workload characteristics.
 
