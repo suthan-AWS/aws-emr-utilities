@@ -175,8 +175,8 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
             end_ts = None
 
             if app_start_row:
-                app_name = app_start_row["`App Name`"] if "`App Name`" in df.columns else getattr(app_start_row, "App Name", "N/A") or "N/A"
-                spark_app_id = app_start_row["`App ID`"] if "`App ID`" in df.columns else getattr(app_start_row, "App ID", "N/A") or "N/A"
+                app_name = getattr(app_start_row, "App Name", None) or "N/A"
+                spark_app_id = getattr(app_start_row, "App ID", None) or "N/A"
                 start_ts = app_start_row["Timestamp"]
 
             if app_end_row:
@@ -201,7 +201,9 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                 try:
                     raw_props = getattr(env_row, "Spark Properties", None)
                     if raw_props:
-                        if isinstance(raw_props, list):
+                        if hasattr(raw_props, "asDict"):
+                            spark_config = raw_props.asDict()
+                        elif isinstance(raw_props, list):
                             spark_config = {r[0]: r[1] for r in raw_props if len(r) >= 2}
                         elif isinstance(raw_props, dict):
                             spark_config = raw_props
