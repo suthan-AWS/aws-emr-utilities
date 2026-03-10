@@ -74,6 +74,13 @@ def phase_a_decompress(input_path, local_base, limit, workers=50):
         name = p.rstrip("/").rsplit("/", 1)[-1]
         if name.startswith("eventlog_v2_"):
             app_prefixes.append((p, name))
+
+    # If no subdirectories found, check if the prefix itself is an app directory
+    if not app_prefixes:
+        dir_name = prefix.rstrip("/").rsplit("/", 1)[-1]
+        if dir_name.startswith("eventlog_v2_"):
+            app_prefixes.append((prefix, dir_name))
+
     app_prefixes = app_prefixes[:limit]
 
     # List ALL files across all apps in one pass
@@ -368,15 +375,22 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
             stage_submitted = df.filter(F.col("Event") == "SparkListenerStageSubmitted")
             stage_completed = df.filter(F.col("Event") == "SparkListenerStageCompleted")
 
-            stage_times = (
-                stage_completed.select(
+            stage_cols = [
                     F.col("`Stage Info`.`Stage ID`").alias("stage_id"),
                     F.col("`Stage Info`.`Stage Name`").alias("stage_name"),
                     F.col("`Stage Info`.`Number of Tasks`").alias("num_tasks"),
                     F.col("`Stage Info`.`Submission Time`").alias("submit_ts"),
                     F.col("`Stage Info`.`Completion Time`").alias("complete_ts"),
-                    F.col("`Stage Info`.`Failure Reason`").alias("failure_reason"),
-                )
+            ]
+            # Failure Reason may not exist in all event log versions
+            stage_info_fields = [f.name for f in stage_completed.schema["`Stage Info`"].dataType.fields] if "`Stage Info`" in [f.name for f in stage_completed.schema.fields] else []
+            if "Failure Reason" in stage_info_fields:
+                stage_cols.append(F.col("`Stage Info`.`Failure Reason`").alias("failure_reason"))
+            else:
+                stage_cols.append(F.lit(None).cast("string").alias("failure_reason"))
+
+            stage_times = (
+                stage_completed.select(*stage_cols)
                 .withColumn("duration_ms", F.col("complete_ts") - F.col("submit_ts"))
             )
 
