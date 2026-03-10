@@ -314,8 +314,11 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                 .withColumn("uptime_hours", F.col("uptime_ms") / (1000.0 * 60 * 60))
             )
 
+            # Count executors allocated (from ExecutorAdded events)
+            executors_allocated = int(exec_added.count())
+
             exec_summary = exec_full.agg(
-                F.count("*").alias("total_executors"),
+                F.count("*").alias("active_executors"),
                 F.coalesce(F.sum("cores"), F.lit(0)).alias("total_cores"),
                 F.round(F.coalesce(F.sum("uptime_hours"), F.lit(0)), 2).alias("total_uptime_hours"),
                 F.round(F.coalesce(F.avg("mem_util"), F.lit(0)), 2).alias("avg_mem_util"),
@@ -324,7 +327,8 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                 F.round(F.coalesce(F.avg("peak_jvm_heap"), F.lit(0)) / GB, 2).alias("avg_peak_gb"),
             ).first()
 
-            total_executors = int(exec_summary["total_executors"] or 0)
+            active_executors = int(exec_summary["active_executors"] or 0)
+            total_executors = executors_allocated
             total_cores = int(exec_summary["total_cores"] or 0)
             total_uptime = float(exec_summary["total_uptime_hours"] or 0)
 
@@ -355,7 +359,8 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                 "stage_summary": {},
                 "executor_summary": {
                     "total_executors": total_executors,
-                    "active_executors": total_executors, "dead_executors": 0,
+                    "active_executors": active_executors,
+                    "idle_executors": total_executors - active_executors,
                     "total_cores": total_cores,
                     "total_uptime_hours": total_uptime,
                     "max_peak_memory_gb": float(exec_summary["max_peak_gb"] or 0),
