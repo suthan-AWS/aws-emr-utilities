@@ -340,12 +340,25 @@ aws emr create-cluster \
 ### Deploy Scripts to EMR Primary Node
 
 ```bash
+# Copy pipeline scripts from your local machine to the EMR primary node
+scp -i <your-key.pem> \
+  spark_extractor.py pipeline_wrapper.py emr_recommender.py \
+  hadoop@<emr-primary-dns>:~/
+
 # SSH to the EMR primary node
 ssh -i <your-key.pem> hadoop@<emr-primary-dns>
 
 # Install Python dependencies (Spark and boto3 are pre-installed on EMR)
 pip install pandas numpy zstandard
+
+# Create the output directory
+mkdir -p /tmp/spark_advisor_output
+
+# Verify Spark is available
+spark-submit --version
 ```
+
+> **Important:** These scripts must be deployed every time you create a new EMR cluster. The MCP server SSHs into the primary node and runs `pipeline_wrapper.py` from `~/`.
 
 ### Performance Benchmarks (r5.24xlarge, 10 apps)
 
