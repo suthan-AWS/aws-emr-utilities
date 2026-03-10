@@ -163,81 +163,19 @@ The MCP server provides **12 specialized tools**. The core tool is `analyze_spar
 ### Prerequisites
 
 - Python 3.10+
-- An EMR on EC2 cluster (Spark pre-installed on primary node) with:
-  - AWS CLI configured with S3 access to your event logs
-  - The pipeline scripts deployed (`spark_extractor.py`, `pipeline_wrapper.py`, `emr_recommender.py`)
+- An EMR on EC2 cluster — see [EMR on EC2 Cluster Setup](#-emr-on-ec2-cluster-setup) below
 - SSH key access to the EMR primary node
 - `mcp` Python package: `pip install mcp`
 
-### 1. Configure the MCP Server
+### 1. Set Up the EMR Cluster
 
-Edit `spark_advisor_mcp.py` and set your EMR primary node connection details:
+Follow the detailed [EMR on EC2 Cluster Setup](#-emr-on-ec2-cluster-setup) section below to:
+- Create an EMR cluster with Spark
+- Deploy the pipeline scripts
+- Install dependencies
+- Configure your MCP client
 
-```python
-EC2_HOST = "hadoop@<your-emr-primary-dns>"
-SSH_KEY = "~/<your-ssh-key>.pem"
-```
-
-### 2. Deploy Pipeline Scripts to EMR Primary Node
-
-```bash
-# Copy the extraction and recommendation scripts
-scp -i <your-key>.pem \
-  spark_extractor.py pipeline_wrapper.py emr_recommender.py \
-  hadoop@<your-emr-primary-dns>:~/
-```
-
-### 3. Register with Your MCP Client
-
-#### Kiro CLI
-
-Add to `~/.kiro/settings/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "spark-config-advisor": {
-      "command": "python3",
-      "args": ["/path/to/spark_advisor_mcp.py"],
-      "env": {
-        "AWS_DEFAULT_REGION": "us-east-1"
-      }
-    }
-  }
-}
-```
-
-#### Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "spark-config-advisor": {
-      "command": "python3",
-      "args": ["/path/to/spark_advisor_mcp.py"]
-    }
-  }
-}
-```
-
-#### Amazon Q CLI
-
-Add to `~/.aws/amazonq/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "spark-config-advisor": {
-      "command": "python3",
-      "args": ["/path/to/spark_advisor_mcp.py"]
-    }
-  }
-}
-```
-
-### 4. Start Using
+### 2. Start Using
 
 ```
 You: "Analyze Spark logs at s3://my-bucket/event-logs/ and recommend cost-optimized configs"
@@ -312,11 +250,11 @@ The primary output — production-ready EMR Serverless Spark configurations deri
 }
 ```
 
-## 🔧 EMR Cluster Setup
+## 🔧 EMR on EC2 Cluster Setup
 
-The extraction pipeline uses PySpark (`spark-submit`), so it must run on a node with Spark installed. The simplest approach is an **EMR on EC2 cluster** — Spark comes pre-installed on the primary node.
+The extraction pipeline uses PySpark (`spark-submit`), so it must run on a node with Spark installed. The MCP server SSHs into the EMR primary node to run the pipeline. This section covers everything you need to set up on the EMR cluster.
 
-### Create an EMR Cluster
+### Step 1: Create an EMR Cluster
 
 ```bash
 aws emr create-cluster \
@@ -325,11 +263,16 @@ aws emr create-cluster \
   --applications Name=Spark \
   --instance-type r5.4xlarge \
   --instance-count 1 \
-  --ec2-attributes KeyName=<your-key-pair> \
-  --use-default-roles
+  --ec2-attributes KeyName=<your-key-pair>,SubnetId=<your-subnet-id> \
+  --use-default-roles \
+  --region us-east-1
 ```
 
-> **Note:** A single-node cluster (primary only) is sufficient — the extractor runs PySpark in local mode on the primary node. The memory requirements below only apply to the **batch extraction phase** (`analyze_spark_logs`). All other interactive tools (list, compare, bottlenecks, etc.) use negligible memory. If you only extract up to 10 apps at a time, an r5.4xlarge is sufficient for any workload.
+A single-node cluster (primary only) is sufficient — the extractor runs PySpark in `local[*]` mode on the primary node.
+
+#### Instance Sizing
+
+The memory requirements only apply to the **batch extraction phase** (`analyze_spark_logs`). All interactive tools (list, compare, bottlenecks, etc.) use negligible memory. If you only extract up to 10 apps at a time, an r5.4xlarge is sufficient for any workload.
 
 | Workload | Instance Type | Memory | Concurrent Apps |
 |---|---|---|---|
@@ -337,28 +280,160 @@ aws emr create-cluster \
 | Medium (10-50 apps) | r5.16xlarge | 512 GB | Up to 50 apps per extraction |
 | Large (50-100+ apps) | r5.24xlarge | 768 GB | 100+ apps per extraction |
 
-### Deploy Scripts to EMR Primary Node
+#### Security Group
+
+Ensure the EMR primary node's security group allows **inbound SSH (port 22)** from your local machine's IP. You can find the security group in the EMR console under **Cluster > Security and access > EC2 security groups > Primary node**.
+
+### Step 2: SSH into the EMR Primary Node
 
 ```bash
-# Copy pipeline scripts from your local machine to the EMR primary node
-scp -i <your-key.pem> \
-  spark_extractor.py pipeline_wrapper.py emr_recommender.py \
-  hadoop@<emr-primary-dns>:~/
+# Get the primary node DNS from the EMR console or CLI
+aws emr describe-cluster --cluster-id <cluster-id> --query 'Cluster.MasterPublicDnsName' --output text
 
-# SSH to the EMR primary node
+# SSH in
 ssh -i <your-key.pem> hadoop@<emr-primary-dns>
-
-# Install Python dependencies (Spark and boto3 are pre-installed on EMR)
-pip install pandas numpy zstandard
-
-# Create the output directory
-mkdir -p /tmp/spark_advisor_output
-
-# Verify Spark is available
-spark-submit --version
 ```
 
-> **Important:** These scripts must be deployed every time you create a new EMR cluster. The MCP server SSHs into the primary node and runs `pipeline_wrapper.py` from `~/`.
+### Step 3: Deploy Pipeline Scripts
+
+From your **local machine**, copy the three pipeline scripts to the EMR primary node:
+
+```bash
+cd mcp-servers/emr-serverless-spark-advisor/
+
+scp -i <your-key.pem> \
+  spark_extractor.py \
+  pipeline_wrapper.py \
+  emr_recommender.py \
+  hadoop@<emr-primary-dns>:~/
+```
+
+### Step 4: Install Python Dependencies
+
+SSH into the EMR primary node and install the required packages. Spark and boto3 are pre-installed on EMR.
+
+```bash
+ssh -i <your-key.pem> hadoop@<emr-primary-dns>
+
+# Install additional Python dependencies
+pip install pandas numpy zstandard
+
+# Create the output directory used by the MCP server
+mkdir -p /tmp/spark_advisor_output
+```
+
+### Step 5: Verify the Setup
+
+Run these checks on the EMR primary node to confirm everything is ready:
+
+```bash
+# Verify Spark is available
+spark-submit --version
+
+# Verify Python dependencies
+python3 -c "import pandas, numpy, zstandard, boto3; print('All dependencies OK')"
+
+# Verify the pipeline scripts are in place
+ls ~/spark_extractor.py ~/pipeline_wrapper.py ~/emr_recommender.py
+
+# Verify S3 access to your event logs
+aws s3 ls s3://<your-bucket>/<your-event-log-prefix>/
+
+# Quick test: run the extractor on a single app (optional)
+spark-submit --master local[*] --conf spark.driver.memory=32g \
+  ~/spark_extractor.py \
+  --input s3://<your-bucket>/<your-event-log-prefix>/ \
+  --output /tmp/spark_advisor_output \
+  --limit 1
+```
+
+If the test succeeds, you should see output like:
+```
+Phase A: Decompressing 1 apps, 470 files with 50 threads
+  Decompressing... 470/470 files
+Phase A done: 1 apps, 1694243 events in 13.0s
+Phase B: Extracting metrics from 1 apps using Spark
+  [1/1] Extracting eventlog_v2_00g0dtj5r0om5o0b...
+Writing 1 results to /tmp/spark_advisor_output
+✅ Extraction complete: 1 applications
+```
+
+### Step 6: Configure the MCP Server (Local Machine)
+
+Back on your **local machine**, configure the MCP server to point to the EMR cluster. Set the environment variables `EC2_HOST` and `SSH_KEY` in your MCP client config:
+
+#### Kiro CLI (`~/.kiro/settings/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "spark-config-advisor": {
+      "command": "python3",
+      "args": ["/path/to/spark_advisor_mcp.py"],
+      "env": {
+        "EC2_HOST": "hadoop@<emr-primary-dns>",
+        "SSH_KEY": "/path/to/<your-key>.pem",
+        "AWS_DEFAULT_REGION": "us-east-1"
+      }
+    }
+  }
+}
+```
+
+#### Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`)
+
+```json
+{
+  "mcpServers": {
+    "spark-config-advisor": {
+      "command": "python3",
+      "args": ["/path/to/spark_advisor_mcp.py"],
+      "env": {
+        "EC2_HOST": "hadoop@<emr-primary-dns>",
+        "SSH_KEY": "/path/to/<your-key>.pem"
+      }
+    }
+  }
+}
+```
+
+#### Amazon Q CLI (`~/.aws/amazonq/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "spark-config-advisor": {
+      "command": "python3",
+      "args": ["/path/to/spark_advisor_mcp.py"],
+      "env": {
+        "EC2_HOST": "hadoop@<emr-primary-dns>",
+        "SSH_KEY": "/path/to/<your-key>.pem"
+      }
+    }
+  }
+}
+```
+
+### When You Create a New EMR Cluster
+
+Every time you spin up a new EMR cluster, you need to:
+
+1. **Deploy the scripts** (Step 3) — `scp` the 3 Python files to `~/`
+2. **Install dependencies** (Step 4) — `pip install pandas numpy zstandard`
+3. **Create output directory** (Step 4) — `mkdir -p /tmp/spark_advisor_output`
+4. **Update MCP config** (Step 6) — change `EC2_HOST` to the new primary node DNS
+5. **Restart your MCP client** — so it picks up the new config
+
+### Troubleshooting
+
+| Issue | Cause | Fix |
+|---|---|---|
+| `Connection refused` or `Connection timed out` | Security group blocks SSH | Add inbound rule for port 22 from your IP |
+| `Permission denied (publickey)` | Wrong SSH key or user | Verify key path and use `hadoop@` as the user |
+| `Pipeline failed: 0 JSON files` | Scripts not deployed | Re-run Step 3 (`scp` the scripts) |
+| `ModuleNotFoundError: pandas` | Dependencies not installed | Re-run Step 4 (`pip install`) |
+| `spark-submit: command not found` | Not an EMR cluster | Use an EMR on EC2 cluster, not a plain EC2 instance |
+| `Loaded 0 JSON files` | Wrong S3 path or no event logs | Verify path with `aws s3 ls s3://your-bucket/prefix/` |
 
 ### Performance Benchmarks (r5.24xlarge, 10 apps)
 
