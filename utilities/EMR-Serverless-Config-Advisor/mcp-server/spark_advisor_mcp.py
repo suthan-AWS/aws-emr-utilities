@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-Spark Config Advisor MCP Server
-Runs analysis on a remote EC2 instance via SSH and returns recommendations.
-Provides interactive querying, comparison, and bottleneck analysis.
+EMR Serverless Spark Config Advisor MCP Server
+
+Analyzes Spark event logs from S3, extracts metrics, generates optimized
+EMR Serverless configurations, and provides interactive querying, comparison,
+and bottleneck analysis through 12 MCP tools.
+
+Configuration via environment variables:
+    EC2_HOST: SSH target (e.g. hadoop@ec2-1-2-3-4.compute-1.amazonaws.com)
+    SSH_KEY:  Path to SSH private key (e.g. ~/.ssh/my-key.pem)
 """
 
 import json
+import os
 import subprocess
 import time
 from mcp.server.fastmcp import FastMCP
 
-EC2_HOST = "hadoop@ec2-3-91-248-12.compute-1.amazonaws.com"
-SSH_KEY = "~/suthan-bda.pem"
+EC2_HOST = os.environ.get("EC2_HOST", "hadoop@localhost")
+SSH_KEY = os.environ.get("SSH_KEY", "~/.ssh/id_rsa")
 SSH_CMD = f"ssh -i {SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {EC2_HOST}"
 EXTRACT_DIR = "/tmp/spark_advisor_output"
 
@@ -29,7 +36,6 @@ def _ssh(cmd, timeout=900):
 
 def _load_app_json(app_id, subdir="task_stage_summary"):
     """Load extracted JSON for an app from EC2."""
-    # Try with and without eventlog_v2_ prefix
     for name in [app_id, f"eventlog_v2_{app_id}"]:
         out, _, rc = _ssh(f"cat {EXTRACT_DIR}/{subdir}/{name}.json 2>/dev/null")
         if rc == 0 and out.strip():
@@ -53,16 +59,19 @@ def analyze_spark_logs(
     input_path: str,
     mode: str = "cost-optimized",
     limit: int = 100,
+    force_extract: bool = False,
 ) -> str:
     """Analyze Spark event logs from S3 and generate EMR Serverless configuration recommendations.
 
     Extracts metrics and generates optimized Spark configs. Results are cached
     for interactive querying with other tools (get_application, compare_*, get_bottlenecks).
+    Previously extracted apps are reused from cache unless force_extract=True.
 
     Args:
         input_path: S3 path to event logs (e.g. s3://bucket/prefix/)
         mode: 'cost-optimized' or 'performance-optimized'
         limit: Max applications to analyze (default 100)
+        force_extract: Re-extract even if cached data exists (default False)
 
     Returns:
         JSON with recommendations per application. IMPORTANT: Always display ALL
@@ -76,6 +85,67 @@ def analyze_spark_logs(
     input_bucket = parts[0]
     input_prefix = parts[1] if len(parts) > 1 else ""
 
+    # Check if extraction data already exists
+    if not force_extract:
+        # List app prefixes from S3 to see what would be extracted
+        check_cmd = f"aws s3 ls s3://{input_bucket}/{input_prefix} --region us-east-1"
+        out, _, rc = _ssh(check_cmd)
+        requested_apps = []
+        if rc == 0:
+            for line in out.strip().split("\n"):
+                if line.strip().startswith("PRE"):
+                    name = line.strip().split()[-1].rstrip("/")
+                    if name.startswith("eventlog_v2_"):
+                        requested_apps.append(name)
+            # If input_path points directly to a single app
+            if not requested_apps:
+                dir_name = input_prefix.rstrip("/").rsplit("/", 1)[-1]
+                if dir_name.startswith("eventlog_v2_"):
+                    requested_apps.append(dir_name)
+
+        requested_apps = requested_apps[:limit]
+
+        # Check which are already cached
+        cached_out, _, _ = _ssh(f"ls {EXTRACT_DIR}/task_stage_summary/ 2>/dev/null")
+        cached_apps = set()
+        if cached_out.strip():
+            cached_apps = {f.replace(".json", "") for f in cached_out.strip().split("\n") if f.endswith(".json")}
+
+        all_cached = requested_apps and all(app in cached_apps for app in requested_apps)
+
+        if all_cached:
+            # Skip extraction, just run recommender
+            run_id = str(int(time.time()))
+            output_file = f"/tmp/recs_{run_id}.json"
+            rec_cmd = (
+                f"cd ~ && python3 emr_recommender.py"
+                f" --input-path {EXTRACT_DIR}"
+                f" --output-cost {output_file.replace('.json', '_cost.json')}"
+                f" --output-perf {output_file.replace('.json', '_perf.json')}"
+                f" --limit {limit}"
+            )
+            if mode == "cost-optimized":
+                rec_cmd += " --cost-optimized"
+            elif mode == "performance-optimized":
+                rec_cmd += " --performance-optimized"
+
+            stdout, stderr, rc = _ssh(rec_cmd)
+            if rc != 0:
+                return json.dumps({"error": f"Recommender failed (exit {rc})", "stderr": stderr[-2000:]})
+
+            cost_file = output_file.replace(".json", "_cost.json")
+            perf_file = output_file.replace(".json", "_perf.json")
+            target = cost_file if mode == "cost-optimized" else perf_file
+            out, _, rc = _ssh(f"cat {target} 2>/dev/null || cat {cost_file} 2>/dev/null || cat {perf_file}")
+            if rc == 0 and out.strip():
+                try:
+                    results = json.loads(out)
+                    return json.dumps({"mode": mode, "cached": True,
+                        "application_count": len(results), "recommendations": results}, indent=2)
+                except json.JSONDecodeError:
+                    pass
+
+    # Full pipeline: extract + recommend
     run_id = str(int(time.time()))
     staging_prefix = f"mcp-staging/{run_id}/"
     output_file = f"/tmp/recs_{run_id}.json"
@@ -172,7 +242,7 @@ def get_application(application_id: str) -> str:
 
 
 @mcp.tool()
-def list_event_log_prefixes(bucket: str = "suthan-event-logs", prefix: str = "") -> str:
+def list_event_log_prefixes(bucket: str, prefix: str = "") -> str:
     """List available Spark event log application prefixes in S3.
 
     Args:
@@ -258,7 +328,6 @@ def compare_job_environments(app_id_1: str, app_id_2: str) -> str:
     cfg1 = c1.get("spark_configuration", {})
     cfg2 = c2.get("spark_configuration", {})
 
-    # Filter out non-meaningful keys
     skip = {"spark.app.id", "spark.app.startTime", "spark.app.submitTime",
             "spark.app.initial.jar.urls", "spark.app.initial.file.urls",
             "spark.app.initial.archive.urls", "spark.driver.host", "spark.driver.port"}
@@ -296,7 +365,7 @@ def get_bottlenecks(application_id: str) -> str:
     """Identify performance bottlenecks for a Spark application with actionable recommendations.
 
     Analyzes executor utilization, memory pressure, spill, shuffle, data skew indicators,
-    and idle resource waste. Returns prioritized findings with severity levels.
+    idle resource waste, and stage-level issues. Returns prioritized findings with severity levels.
 
     Args:
         application_id: The application ID
@@ -309,10 +378,8 @@ def get_bottlenecks(application_id: str) -> str:
     ex = data.get("executor_summary", {})
     sp = data.get("spill_summary", {})
     info = data.get("application_info", {})
-
     findings = []
 
-    # CPU utilization
     cpu = ex.get("avg_cpu_utilization_percent", 0) or 0
     if cpu < 20:
         findings.append({"severity": "HIGH", "category": "CPU",
@@ -323,7 +390,6 @@ def get_bottlenecks(application_id: str) -> str:
             "finding": f"Low CPU utilization ({cpu}%)",
             "recommendation": "Consider reducing executor cores. Some over-provisioning detected."})
 
-    # Memory utilization
     mem = ex.get("avg_memory_utilization_percent", 0) or 0
     peak = ex.get("max_peak_memory_gb", 0) or 0
     if mem > 85:
@@ -335,35 +401,31 @@ def get_bottlenecks(application_id: str) -> str:
             "finding": f"Low memory utilization ({mem}%, peak {peak} GB)",
             "recommendation": "Reduce executor memory to save cost."})
 
-    # Idle executors
     total_exec = ex.get("total_executors", 0) or 0
     active_exec = ex.get("active_executors", 0) or 0
     idle_exec = total_exec - active_exec
-    if idle_exec > 0:
+    if idle_exec > 0 and total_exec > 0:
         idle_pct = round(idle_exec / total_exec * 100, 1)
         sev = "HIGH" if idle_pct > 30 else "MEDIUM"
         findings.append({"severity": sev, "category": "Executors",
             "finding": f"{idle_exec}/{total_exec} executors ({idle_pct}%) were allocated but never ran tasks",
             "recommendation": "Tune spark.dynamicAllocation.maxExecutors or increase minExecutors idle timeout."})
 
-    # Idle cores
     idle_core = ex.get("idle_core_percentage", 0) or 0
     if idle_core > 80:
         findings.append({"severity": "HIGH", "category": "Cores",
             "finding": f"Idle core percentage is {idle_core}%",
             "recommendation": "Most core-hours are wasted. Reduce total cores or improve parallelism."})
 
-    # Spill
     mem_spill = sp.get("total_memory_spilled_gb", 0) or 0
     disk_spill = sp.get("total_disk_spilled_gb", 0) or 0
     total_input = io.get("total_input_gb", 0) or 0
     if disk_spill > 0:
-        sev = "HIGH" if disk_spill > total_input * 0.1 else "MEDIUM"
+        sev = "HIGH" if total_input == 0 or disk_spill > total_input * 0.1 else "MEDIUM"
         findings.append({"severity": sev, "category": "Spill",
             "finding": f"Disk spill: {disk_spill} GB, Memory spill: {mem_spill} GB",
             "recommendation": "Increase executor memory or spark.sql.shuffle.partitions to reduce spill."})
 
-    # Shuffle volume
     shuffle_write = io.get("total_shuffle_write_gb", 0) or 0
     if total_input > 0 and shuffle_write > total_input * 0.5:
         ratio = round(shuffle_write / total_input * 100, 1)
@@ -371,14 +433,12 @@ def get_bottlenecks(application_id: str) -> str:
             "finding": f"Shuffle write is {ratio}% of input ({shuffle_write} GB shuffle vs {total_input} GB input)",
             "recommendation": "Consider broadcast joins for small tables, or increase shuffle partitions."})
 
-    # Short duration with many executors (over-provisioned)
     duration = info.get("total_run_duration_hours", 0) or 0
     if duration < 0.1 and total_exec > 50:
         findings.append({"severity": "MEDIUM", "category": "Provisioning",
             "finding": f"Short job ({round(duration*60, 1)} min) with {total_exec} executors",
             "recommendation": "Job finishes quickly — reduce max executors to avoid allocation overhead."})
 
-    # Stage-level bottlenecks
     stages = data.get("stage_summary", {}).get("stages", [])
     if stages:
         total_stage_time = sum(s.get("duration_sec", 0) for s in stages)
@@ -390,7 +450,6 @@ def get_bottlenecks(application_id: str) -> str:
                     "finding": f"Stage {slowest['stage_id']} takes {slowest_pct}% of total time ({slowest['duration_sec']}s): {slowest.get('name', '')[:60]}",
                     "recommendation": "Focus optimization on this dominant stage."})
 
-        # Stages with spill
         spill_stages = [s for s in stages if s.get("disk_spill_gb", 0) > 0]
         if spill_stages:
             worst = max(spill_stages, key=lambda s: s["disk_spill_gb"])
@@ -398,7 +457,6 @@ def get_bottlenecks(application_id: str) -> str:
                 "finding": f"{len(spill_stages)} stages have disk spill. Worst: stage {worst['stage_id']} ({worst['disk_spill_gb']} GB)",
                 "recommendation": f"Increase memory or partitions for stage {worst['stage_id']}."})
 
-        # Failed stages
         failed = [s for s in stages if s.get("failure_reason")]
         if failed:
             findings.append({"severity": "HIGH", "category": "Failures",
@@ -407,12 +465,7 @@ def get_bottlenecks(application_id: str) -> str:
                     f"stage {s['stage_id']}: {(s['failure_reason'] or '')[:80]}" for s in failed[:3])})
 
     findings.sort(key=lambda f: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f["severity"], 3))
-
-    return json.dumps({
-        "application_id": application_id,
-        "bottleneck_count": len(findings),
-        "findings": findings,
-    }, indent=2)
+    return json.dumps({"application_id": application_id, "bottleneck_count": len(findings), "findings": findings}, indent=2)
 
 
 # ── Stage Analysis ───────────────────────────────────────────────────
@@ -451,8 +504,7 @@ def get_stage_details(application_id: str, stage_id: int) -> str:
     if not data:
         return json.dumps({"error": f"Application {application_id} not found."})
 
-    stages = data.get("stage_summary", {}).get("stages", [])
-    for s in stages:
+    for s in data.get("stage_summary", {}).get("stages", []):
         if s["stage_id"] == stage_id:
             return json.dumps(s, indent=2)
     return json.dumps({"error": f"Stage {stage_id} not found."})
@@ -477,30 +529,21 @@ def get_resource_timeline(application_id: str) -> str:
     if not timeline:
         return json.dumps({"error": "No timeline data. Re-run analyze_spark_logs to extract timeline."})
 
-    # Compute running executor count at each point
     running = 0
     peak = 0
     annotated = []
     for evt in timeline:
-        if evt["event"] == "added":
-            running += 1
-        else:
-            running -= 1
+        running += 1 if evt["event"] == "added" else -1
         peak = max(peak, running)
         annotated.append({**evt, "active_count": running})
 
-    # Add relative time using first event as baseline
     if annotated:
         base_ts = annotated[0]["time_ms"]
         for evt in annotated:
             evt["relative_sec"] = round((evt["time_ms"] - base_ts) / 1000, 1)
 
-    return json.dumps({
-        "application_id": application_id,
-        "total_events": len(annotated),
-        "peak_executors": peak,
-        "timeline": annotated,
-    }, indent=2)
+    return json.dumps({"application_id": application_id, "total_events": len(annotated),
+                        "peak_executors": peak, "timeline": annotated}, indent=2)
 
 
 # ── SQL Plan Analysis ────────────────────────────────────────────────
@@ -520,7 +563,6 @@ def list_sql_executions(application_id: str) -> str:
     if not sqls:
         return json.dumps({"error": "No SQL data. App may not use Spark SQL."})
 
-    # Return without full plans for listing
     summary = [{"execution_id": s["execution_id"], "description": s["description"],
                 "duration_sec": s["duration_sec"],
                 "plan_length": len(s.get("physical_plan", ""))} for s in sqls]
@@ -554,23 +596,17 @@ def compare_sql_execution_plans(
                 return s
         return None
 
-    s1 = find_sql(d1, sql_id_1)
-    s2 = find_sql(d2, sql_id_2)
+    s1, s2 = find_sql(d1, sql_id_1), find_sql(d2, sql_id_2)
     if not s1 or not s2:
         missing = f"{app_id_1}/sql_{sql_id_1}" if not s1 else f"{app_id_2}/sql_{sql_id_2}"
         return json.dumps({"error": f"SQL execution {missing} not found."})
 
-    # Extract operator nodes from plans for comparison
     def extract_operators(plan_text):
-        ops = []
-        for line in plan_text.split("\n"):
-            stripped = line.lstrip("+- ").lstrip(":")
-            if stripped and not stripped.startswith("=="):
-                ops.append(stripped.split("(")[0].strip() if "(" in stripped else stripped.strip())
-        return ops
+        return [line.lstrip("+- ").lstrip(":").split("(")[0].strip()
+                for line in plan_text.split("\n")
+                if line.strip() and not line.strip().startswith("==")]
 
-    ops1 = extract_operators(s1.get("physical_plan", ""))
-    ops2 = extract_operators(s2.get("physical_plan", ""))
+    ops1, ops2 = extract_operators(s1.get("physical_plan", "")), extract_operators(s2.get("physical_plan", ""))
 
     return json.dumps({
         "query_1": {"app": app_id_1, "sql_id": sql_id_1, "description": s1["description"],
@@ -578,8 +614,7 @@ def compare_sql_execution_plans(
         "query_2": {"app": app_id_2, "sql_id": sql_id_2, "description": s2["description"],
                      "duration_sec": s2["duration_sec"], "plan": s2.get("physical_plan", "")[:5000]},
         "operator_diff": {
-            "operators_in_1": len(ops1),
-            "operators_in_2": len(ops2),
+            "operators_in_1": len(ops1), "operators_in_2": len(ops2),
             "unique_to_1": list(set(ops1) - set(ops2))[:20],
             "unique_to_2": list(set(ops2) - set(ops1))[:20],
         }
