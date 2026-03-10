@@ -59,16 +59,19 @@ def analyze_spark_logs(
     input_path: str,
     mode: str = "cost-optimized",
     limit: int = 100,
+    force_extract: bool = False,
 ) -> str:
     """Analyze Spark event logs from S3 and generate EMR Serverless configuration recommendations.
 
     Extracts metrics and generates optimized Spark configs. Results are cached
     for interactive querying with other tools (get_application, compare_*, get_bottlenecks).
+    Previously extracted apps are reused from cache unless force_extract=True.
 
     Args:
         input_path: S3 path to event logs (e.g. s3://bucket/prefix/)
         mode: 'cost-optimized' or 'performance-optimized'
         limit: Max applications to analyze (default 100)
+        force_extract: Re-extract even if cached data exists (default False)
 
     Returns:
         JSON with recommendations per application. IMPORTANT: Always display ALL
@@ -82,6 +85,67 @@ def analyze_spark_logs(
     input_bucket = parts[0]
     input_prefix = parts[1] if len(parts) > 1 else ""
 
+    # Check if extraction data already exists
+    if not force_extract:
+        # List app prefixes from S3 to see what would be extracted
+        check_cmd = f"aws s3 ls s3://{input_bucket}/{input_prefix} --region us-east-1"
+        out, _, rc = _ssh(check_cmd)
+        requested_apps = []
+        if rc == 0:
+            for line in out.strip().split("\n"):
+                if line.strip().startswith("PRE"):
+                    name = line.strip().split()[-1].rstrip("/")
+                    if name.startswith("eventlog_v2_"):
+                        requested_apps.append(name)
+            # If input_path points directly to a single app
+            if not requested_apps:
+                dir_name = input_prefix.rstrip("/").rsplit("/", 1)[-1]
+                if dir_name.startswith("eventlog_v2_"):
+                    requested_apps.append(dir_name)
+
+        requested_apps = requested_apps[:limit]
+
+        # Check which are already cached
+        cached_out, _, _ = _ssh(f"ls {EXTRACT_DIR}/task_stage_summary/ 2>/dev/null")
+        cached_apps = set()
+        if cached_out.strip():
+            cached_apps = {f.replace(".json", "") for f in cached_out.strip().split("\n") if f.endswith(".json")}
+
+        all_cached = requested_apps and all(app in cached_apps for app in requested_apps)
+
+        if all_cached:
+            # Skip extraction, just run recommender
+            run_id = str(int(time.time()))
+            output_file = f"/tmp/recs_{run_id}.json"
+            rec_cmd = (
+                f"cd ~ && python3 emr_recommender.py"
+                f" --input-path {EXTRACT_DIR}"
+                f" --output-cost {output_file.replace('.json', '_cost.json')}"
+                f" --output-perf {output_file.replace('.json', '_perf.json')}"
+                f" --limit {limit}"
+            )
+            if mode == "cost-optimized":
+                rec_cmd += " --cost-optimized"
+            elif mode == "performance-optimized":
+                rec_cmd += " --performance-optimized"
+
+            stdout, stderr, rc = _ssh(rec_cmd)
+            if rc != 0:
+                return json.dumps({"error": f"Recommender failed (exit {rc})", "stderr": stderr[-2000:]})
+
+            cost_file = output_file.replace(".json", "_cost.json")
+            perf_file = output_file.replace(".json", "_perf.json")
+            target = cost_file if mode == "cost-optimized" else perf_file
+            out, _, rc = _ssh(f"cat {target} 2>/dev/null || cat {cost_file} 2>/dev/null || cat {perf_file}")
+            if rc == 0 and out.strip():
+                try:
+                    results = json.loads(out)
+                    return json.dumps({"mode": mode, "cached": True,
+                        "application_count": len(results), "recommendations": results}, indent=2)
+                except json.JSONDecodeError:
+                    pass
+
+    # Full pipeline: extract + recommend
     run_id = str(int(time.time()))
     staging_prefix = f"mcp-staging/{run_id}/"
     output_file = f"/tmp/recs_{run_id}.json"
