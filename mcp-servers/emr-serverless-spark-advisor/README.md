@@ -151,6 +151,7 @@ aws emr describe-cluster --cluster-id <cluster-id> \
 # Copy pipeline scripts
 scp -i <your-key.pem> \
   spark_extractor.py pipeline_wrapper.py emr_recommender.py \
+  write_to_iceberg.py format_to_job_config.py \
   hadoop@<emr-primary-dns>:~/
 
 # SSH in and install dependencies
@@ -210,7 +211,7 @@ On the EMR node:
 ```bash
 spark-submit --version
 python3 -c "import pandas, numpy, zstandard, boto3; print('OK')"
-ls ~/spark_extractor.py ~/pipeline_wrapper.py ~/emr_recommender.py
+ls ~/spark_extractor.py ~/pipeline_wrapper.py ~/emr_recommender.py ~/write_to_iceberg.py
 aws s3 ls s3://<your-bucket>/<your-event-log-prefix>/
 ```
 
@@ -296,7 +297,7 @@ Memory is only needed during extraction (`analyze_spark_logs`). All other tools 
 
 When you create a new cluster, repeat these steps:
 
-1. `scp` the 3 scripts to `~/` on the primary node
+1. `scp` the 5 scripts to `~/` on the primary node
 2. `pip install pandas numpy zstandard`
 3. `mkdir -p /tmp/spark_advisor_output`
 4. Update `EC2_HOST` in your MCP client config
@@ -321,6 +322,8 @@ emr-serverless-spark-advisor/
 ├── spark_extractor.py        # PySpark metric extraction (runs on EMR)
 ├── pipeline_wrapper.py       # Orchestrates extract → recommend (runs on EMR)
 ├── emr_recommender.py        # EMR Serverless config generator (runs on EMR)
+├── write_to_iceberg.py       # Write recommendations to Iceberg table via Athena (runs on EMR)
+├── format_to_job_config.py   # Format recommendations as EMR Serverless job configs (runs on EMR)
 ├── requirements.txt          # Local dependencies (mcp, boto3)
 └── README.md
 ```
