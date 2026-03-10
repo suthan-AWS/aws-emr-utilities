@@ -71,7 +71,9 @@ def analyze_spark_logs(
         limit: Max applications to analyze (default 100)
 
     Returns:
-        JSON with recommendations per application.
+        JSON with recommendations per application. IMPORTANT: Always display ALL
+        spark_configs to the user including timeouts, S3 resilience, shuffle compression,
+        and Iceberg settings — not just executor/memory/partition configs.
     """
     if not input_path.startswith("s3://"):
         return json.dumps({"error": "input_path must be an S3 path (s3://bucket/prefix/)"})
