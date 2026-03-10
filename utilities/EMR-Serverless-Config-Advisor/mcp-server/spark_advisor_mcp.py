@@ -376,12 +376,211 @@ def get_bottlenecks(application_id: str) -> str:
             "finding": f"Short job ({round(duration*60, 1)} min) with {total_exec} executors",
             "recommendation": "Job finishes quickly — reduce max executors to avoid allocation overhead."})
 
+    # Stage-level bottlenecks
+    stages = data.get("stage_summary", {}).get("stages", [])
+    if stages:
+        total_stage_time = sum(s.get("duration_sec", 0) for s in stages)
+        if total_stage_time > 0:
+            slowest = max(stages, key=lambda s: s.get("duration_sec", 0))
+            slowest_pct = round(slowest["duration_sec"] / total_stage_time * 100, 1)
+            if slowest_pct > 50:
+                findings.append({"severity": "HIGH", "category": "Stage",
+                    "finding": f"Stage {slowest['stage_id']} takes {slowest_pct}% of total time ({slowest['duration_sec']}s): {slowest.get('name', '')[:60]}",
+                    "recommendation": "Focus optimization on this dominant stage."})
+
+        # Stages with spill
+        spill_stages = [s for s in stages if s.get("disk_spill_gb", 0) > 0]
+        if spill_stages:
+            worst = max(spill_stages, key=lambda s: s["disk_spill_gb"])
+            findings.append({"severity": "MEDIUM", "category": "Stage Spill",
+                "finding": f"{len(spill_stages)} stages have disk spill. Worst: stage {worst['stage_id']} ({worst['disk_spill_gb']} GB)",
+                "recommendation": f"Increase memory or partitions for stage {worst['stage_id']}."})
+
+        # Failed stages
+        failed = [s for s in stages if s.get("failure_reason")]
+        if failed:
+            findings.append({"severity": "HIGH", "category": "Failures",
+                "finding": f"{len(failed)} stages failed",
+                "recommendation": "Check failure reasons: " + "; ".join(
+                    f"stage {s['stage_id']}: {(s['failure_reason'] or '')[:80]}" for s in failed[:3])})
+
     findings.sort(key=lambda f: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f["severity"], 3))
 
     return json.dumps({
         "application_id": application_id,
         "bottleneck_count": len(findings),
         "findings": findings,
+    }, indent=2)
+
+
+# ── Stage Analysis ───────────────────────────────────────────────────
+
+@mcp.tool()
+def list_slowest_stages(application_id: str, top_n: int = 10) -> str:
+    """Get the N slowest stages for a Spark application, sorted by duration.
+
+    Shows per-stage duration, task count, IO, shuffle, and spill metrics.
+
+    Args:
+        application_id: The application ID
+        top_n: Number of slowest stages to return (default 10)
+    """
+    data = _load_app_json(application_id)
+    if not data:
+        return json.dumps({"error": f"Application {application_id} not found."})
+
+    stages = data.get("stage_summary", {}).get("stages", [])
+    if not stages:
+        return json.dumps({"error": "No stage data. Re-run analyze_spark_logs to extract stage details."})
+
+    stages_sorted = sorted(stages, key=lambda s: s.get("duration_sec", 0), reverse=True)[:top_n]
+    return json.dumps({"application_id": application_id, "slowest_stages": stages_sorted}, indent=2)
+
+
+@mcp.tool()
+def get_stage_details(application_id: str, stage_id: int) -> str:
+    """Get detailed metrics for a specific stage.
+
+    Args:
+        application_id: The application ID
+        stage_id: The stage ID number
+    """
+    data = _load_app_json(application_id)
+    if not data:
+        return json.dumps({"error": f"Application {application_id} not found."})
+
+    stages = data.get("stage_summary", {}).get("stages", [])
+    for s in stages:
+        if s["stage_id"] == stage_id:
+            return json.dumps(s, indent=2)
+    return json.dumps({"error": f"Stage {stage_id} not found."})
+
+
+# ── Resource Timeline ────────────────────────────────────────────────
+
+@mcp.tool()
+def get_resource_timeline(application_id: str) -> str:
+    """Get chronological executor add/remove events showing resource allocation over time.
+
+    Useful for understanding scaling behavior and identifying over/under-provisioning periods.
+
+    Args:
+        application_id: The application ID
+    """
+    data = _load_app_json(application_id)
+    if not data:
+        return json.dumps({"error": f"Application {application_id} not found."})
+
+    timeline = data.get("executor_timeline", [])
+    if not timeline:
+        return json.dumps({"error": "No timeline data. Re-run analyze_spark_logs to extract timeline."})
+
+    # Compute running executor count at each point
+    running = 0
+    peak = 0
+    annotated = []
+    for evt in timeline:
+        if evt["event"] == "added":
+            running += 1
+        else:
+            running -= 1
+        peak = max(peak, running)
+        annotated.append({**evt, "active_count": running})
+
+    # Add relative time using first event as baseline
+    if annotated:
+        base_ts = annotated[0]["time_ms"]
+        for evt in annotated:
+            evt["relative_sec"] = round((evt["time_ms"] - base_ts) / 1000, 1)
+
+    return json.dumps({
+        "application_id": application_id,
+        "total_events": len(annotated),
+        "peak_executors": peak,
+        "timeline": annotated,
+    }, indent=2)
+
+
+# ── SQL Plan Analysis ────────────────────────────────────────────────
+
+@mcp.tool()
+def list_sql_executions(application_id: str) -> str:
+    """List all SQL executions for a Spark application with duration and description.
+
+    Args:
+        application_id: The application ID
+    """
+    data = _load_app_json(application_id)
+    if not data:
+        return json.dumps({"error": f"Application {application_id} not found."})
+
+    sqls = data.get("sql_executions", [])
+    if not sqls:
+        return json.dumps({"error": "No SQL data. App may not use Spark SQL."})
+
+    # Return without full plans for listing
+    summary = [{"execution_id": s["execution_id"], "description": s["description"],
+                "duration_sec": s["duration_sec"],
+                "plan_length": len(s.get("physical_plan", ""))} for s in sqls]
+    return json.dumps({"application_id": application_id, "sql_executions": summary}, indent=2)
+
+
+@mcp.tool()
+def compare_sql_execution_plans(
+    app_id_1: str, sql_id_1: int,
+    app_id_2: str, sql_id_2: int,
+) -> str:
+    """Compare SQL execution plans between two Spark SQL queries.
+
+    Can compare across different applications or within the same app.
+
+    Args:
+        app_id_1: First application ID
+        sql_id_1: SQL execution ID in first app
+        app_id_2: Second application ID
+        sql_id_2: SQL execution ID in second app
+    """
+    d1 = _load_app_json(app_id_1)
+    d2 = _load_app_json(app_id_2)
+    if not d1 or not d2:
+        missing = app_id_1 if not d1 else app_id_2
+        return json.dumps({"error": f"Application {missing} not found."})
+
+    def find_sql(data, sql_id):
+        for s in data.get("sql_executions", []):
+            if s["execution_id"] == sql_id:
+                return s
+        return None
+
+    s1 = find_sql(d1, sql_id_1)
+    s2 = find_sql(d2, sql_id_2)
+    if not s1 or not s2:
+        missing = f"{app_id_1}/sql_{sql_id_1}" if not s1 else f"{app_id_2}/sql_{sql_id_2}"
+        return json.dumps({"error": f"SQL execution {missing} not found."})
+
+    # Extract operator nodes from plans for comparison
+    def extract_operators(plan_text):
+        ops = []
+        for line in plan_text.split("\n"):
+            stripped = line.lstrip("+- ").lstrip(":")
+            if stripped and not stripped.startswith("=="):
+                ops.append(stripped.split("(")[0].strip() if "(" in stripped else stripped.strip())
+        return ops
+
+    ops1 = extract_operators(s1.get("physical_plan", ""))
+    ops2 = extract_operators(s2.get("physical_plan", ""))
+
+    return json.dumps({
+        "query_1": {"app": app_id_1, "sql_id": sql_id_1, "description": s1["description"],
+                     "duration_sec": s1["duration_sec"], "plan": s1.get("physical_plan", "")[:5000]},
+        "query_2": {"app": app_id_2, "sql_id": sql_id_2, "description": s2["description"],
+                     "duration_sec": s2["duration_sec"], "plan": s2.get("physical_plan", "")[:5000]},
+        "operator_diff": {
+            "operators_in_1": len(ops1),
+            "operators_in_2": len(ops2),
+            "unique_to_1": list(set(ops1) - set(ops2))[:20],
+            "unique_to_2": list(set(ops2) - set(ops1))[:20],
+        }
     }, indent=2)
 
 

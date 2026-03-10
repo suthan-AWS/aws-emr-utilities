@@ -341,6 +341,106 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                 (total_cores * total_uptime * 0.05) + (total_executors * executor_memory_gb * total_uptime * 0.005), 4
             ) if total_cores else 0
 
+            # ── Per-stage details ─────────────────────────────────
+            stage_submitted = df.filter(F.col("Event") == "SparkListenerStageSubmitted")
+            stage_completed = df.filter(F.col("Event") == "SparkListenerStageCompleted")
+
+            stage_times = (
+                stage_completed.select(
+                    F.col("`Stage Info`.`Stage ID`").alias("stage_id"),
+                    F.col("`Stage Info`.`Stage Name`").alias("stage_name"),
+                    F.col("`Stage Info`.`Number of Tasks`").alias("num_tasks"),
+                    F.col("`Stage Info`.`Submission Time`").alias("submit_ts"),
+                    F.col("`Stage Info`.`Completion Time`").alias("complete_ts"),
+                    F.col("`Stage Info`.`Failure Reason`").alias("failure_reason"),
+                )
+                .withColumn("duration_ms", F.col("complete_ts") - F.col("submit_ts"))
+            )
+
+            # Per-stage IO from TaskEnd
+            stage_io = (
+                task_ends.select(
+                    F.col("`Stage ID`").alias("stage_id"),
+                    F.col("`Task Metrics`.`Input Metrics`.`Bytes Read`").alias("input_bytes"),
+                    F.col("`Task Metrics`.`Output Metrics`.`Bytes Written`").alias("output_bytes"),
+                    F.col("`Task Metrics`.`Shuffle Read Metrics`.`Remote Bytes Read`").alias("shuffle_remote"),
+                    F.col("`Task Metrics`.`Shuffle Read Metrics`.`Local Bytes Read`").alias("shuffle_local"),
+                    F.col("`Task Metrics`.`Shuffle Write Metrics`.`Shuffle Bytes Written`").alias("shuffle_write"),
+                    F.col("`Task Metrics`.`Memory Bytes Spilled`").alias("mem_spill"),
+                    F.col("`Task Metrics`.`Disk Bytes Spilled`").alias("disk_spill"),
+                    F.col("`Task Metrics`.`Executor Run Time`").alias("run_time"),
+                )
+                .groupBy("stage_id")
+                .agg(
+                    F.count("*").alias("tasks_completed"),
+                    F.round(F.coalesce(F.sum("input_bytes"), F.lit(0)) / GB, 2).alias("input_gb"),
+                    F.round(F.coalesce(F.sum("output_bytes"), F.lit(0)) / GB, 2).alias("output_gb"),
+                    F.round((F.coalesce(F.sum("shuffle_remote"), F.lit(0)) + F.coalesce(F.sum("shuffle_local"), F.lit(0))) / GB, 2).alias("shuffle_read_gb"),
+                    F.round(F.coalesce(F.sum("shuffle_write"), F.lit(0)) / GB, 2).alias("shuffle_write_gb"),
+                    F.round(F.coalesce(F.sum("mem_spill"), F.lit(0)) / GB, 2).alias("mem_spill_gb"),
+                    F.round(F.coalesce(F.sum("disk_spill"), F.lit(0)) / GB, 2).alias("disk_spill_gb"),
+                    F.round(F.coalesce(F.sum("run_time"), F.lit(0)) / 1000.0, 1).alias("total_task_time_s"),
+                )
+            )
+
+            stage_details_df = stage_times.join(stage_io, "stage_id", "left")
+            stage_details_rows = stage_details_df.orderBy("stage_id").collect()
+            stage_details = []
+            for r in stage_details_rows:
+                stage_details.append({
+                    "stage_id": int(r["stage_id"]),
+                    "name": r["stage_name"][:100] if r["stage_name"] else "",
+                    "num_tasks": int(r["num_tasks"] or 0),
+                    "tasks_completed": int(r["tasks_completed"] or 0),
+                    "duration_sec": round(float(r["duration_ms"] or 0) / 1000, 1),
+                    "input_gb": float(r["input_gb"] or 0),
+                    "output_gb": float(r["output_gb"] or 0),
+                    "shuffle_read_gb": float(r["shuffle_read_gb"] or 0),
+                    "shuffle_write_gb": float(r["shuffle_write_gb"] or 0),
+                    "mem_spill_gb": float(r["mem_spill_gb"] or 0),
+                    "disk_spill_gb": float(r["disk_spill_gb"] or 0),
+                    "total_task_time_sec": float(r["total_task_time_s"] or 0),
+                    "failure_reason": r["failure_reason"],
+                })
+
+            # ── Executor timeline ────────────────────────────────
+            added_rows = exec_added.orderBy("add_ts").collect()
+            removed_rows = exec_removed.orderBy("remove_ts").collect()
+            executor_timeline = (
+                [{"time_ms": int(r["add_ts"]), "event": "added", "executor_id": r["added_id"],
+                  "cores": int(r["cores"] or executor_cores_cfg)} for r in added_rows]
+                + [{"time_ms": int(r["remove_ts"]), "event": "removed", "executor_id": r["removed_id"]}
+                   for r in removed_rows]
+            )
+            executor_timeline.sort(key=lambda x: x["time_ms"])
+
+            # ── SQL plans ────────────────────────────────────────
+            sql_starts = df.filter(F.col("Event") == "org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionStart")
+            sql_ends = df.filter(F.col("Event") == "org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd")
+
+            sql_start_rows = sql_starts.select(
+                F.col("executionId").alias("exec_id"),
+                F.col("description"),
+                F.col("physicalPlanDescription").alias("plan"),
+                F.col("time").alias("start_time"),
+            ).collect()
+
+            sql_end_map = {}
+            for r in sql_ends.select(F.col("executionId").alias("exec_id"), F.col("time").alias("end_time")).collect():
+                sql_end_map[r["exec_id"]] = r["end_time"]
+
+            sql_executions = []
+            for r in sql_start_rows:
+                eid = r["exec_id"]
+                end_t = sql_end_map.get(eid)
+                dur = (end_t - r["start_time"]) if end_t and r["start_time"] else None
+                sql_executions.append({
+                    "execution_id": int(eid),
+                    "description": (r["description"] or "")[:200],
+                    "duration_sec": round(dur / 1000, 1) if dur else None,
+                    "physical_plan": r["plan"] or "",
+                })
+
             # ── Build output ─────────────────────────────────────
             task_stage_output = {
                 "application_id": app_id,
@@ -356,7 +456,7 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                     "total_run_duration_hours": duration_hours,
                 },
                 "task_summary": {"total_tasks": task_count},
-                "stage_summary": {},
+                "stage_summary": {"stages": stage_details, "total_stages": len(stage_details)},
                 "executor_summary": {
                     "total_executors": total_executors,
                     "active_executors": active_executors,
@@ -393,6 +493,8 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
                     "tasks_analyzed": task_count,
                 },
                 "total_cost_factor": cost_factor,
+                "executor_timeline": executor_timeline,
+                "sql_executions": sql_executions,
             }
 
             config_output = {
