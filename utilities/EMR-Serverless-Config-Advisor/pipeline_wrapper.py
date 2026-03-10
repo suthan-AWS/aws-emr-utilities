@@ -19,6 +19,7 @@ from pathlib import Path
 
 # Pipeline configuration
 SPARK_PROCESSOR_SCRIPT = "spark_processor.py"
+SPARK_EXTRACTOR_SCRIPT = "spark_extractor.py"
 RECOMMENDER_SCRIPT = "emr_recommender.py"
 
 # Default S3 locations
@@ -224,18 +225,39 @@ def main():
         print("STAGE 1: EXTRACT METRICS FROM EVENT LOGS")
         print(f"{'='*80}")
         
-        # Update spark processor configuration
-        if not update_spark_processor_config(input_path, output_path):
-            print("\n✗ Pipeline failed: Configuration update failed")
-            sys.exit(1)
+        # Check if spark-submit is available for fast extraction
+        import shutil
+        use_spark = shutil.which("spark-submit") and Path(SPARK_EXTRACTOR_SCRIPT).exists()
         
-        # Run spark processor
-        cmd = ["python3", SPARK_PROCESSOR_SCRIPT]
-        if args.last_hours:
-            cmd.extend(["--last-hours", str(args.last_hours)])
-        if not run_command(cmd, "Metric Extraction"):
-            print("\n✗ Pipeline failed: Metric extraction failed")
-            sys.exit(1)
+        if use_spark:
+            print("Using PySpark extractor (parallel decompression + aggregation)")
+            cmd = [
+                "spark-submit",
+                "--master", "local[*]",
+                "--conf", "spark.driver.memory=32g",
+                "--conf", "spark.sql.adaptive.enabled=true",
+                SPARK_EXTRACTOR_SCRIPT,
+                "--input", input_path,
+                "--output", output_path,
+                "--limit", str(args.limit),
+            ]
+            if not run_command(cmd, "Spark Metric Extraction"):
+                print("\n⚠ Spark extraction failed, falling back to Python extractor...")
+                use_spark = False
+        
+        if not use_spark:
+            print("Using Python extractor (sequential)")
+            # Update spark processor configuration
+            if not update_spark_processor_config(input_path, output_path):
+                print("\n✗ Pipeline failed: Configuration update failed")
+                sys.exit(1)
+            
+            cmd = ["python3", SPARK_PROCESSOR_SCRIPT]
+            if args.last_hours:
+                cmd.extend(["--last-hours", str(args.last_hours)])
+            if not run_command(cmd, "Metric Extraction"):
+                print("\n✗ Pipeline failed: Metric extraction failed")
+                sys.exit(1)
     else:
         print(f"\n⊘ Skipping extraction (using existing data in staging)")
     
