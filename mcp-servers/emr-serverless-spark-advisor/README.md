@@ -259,9 +259,9 @@ The extraction pipeline uses PySpark (`spark-submit`), so it must run on a node 
 ```bash
 aws emr create-cluster \
   --name "spark-advisor-processing" \
-  --release-label emr-7.0.0 \
+  --release-label emr-7.12.0 \
   --applications Name=Spark \
-  --instance-type r5.4xlarge \
+  --instance-type r8g.4xlarge \
   --instance-count 1 \
   --ec2-attributes KeyName=<your-key-pair>,SubnetId=<your-subnet-id> \
   --use-default-roles \
@@ -272,13 +272,13 @@ A single-node cluster (primary only) is sufficient — the extractor runs PySpar
 
 #### Instance Sizing
 
-The memory requirements only apply to the **batch extraction phase** (`analyze_spark_logs`). All interactive tools (list, compare, bottlenecks, etc.) use negligible memory. If you only extract up to 10 apps at a time, an r5.4xlarge is sufficient for any workload.
+The memory requirements only apply to the **batch extraction phase** (`analyze_spark_logs`). All interactive tools (list, compare, bottlenecks, etc.) use negligible memory. If you only extract up to 10 apps at a time, an r8g.4xlarge is sufficient for any workload.
 
 | Workload | Instance Type | Memory | Concurrent Apps |
 |---|---|---|---|
-| Small (1-10 apps) | r5.4xlarge | 128 GB | Up to 10 apps per extraction |
-| Medium (10-50 apps) | r5.16xlarge | 512 GB | Up to 50 apps per extraction |
-| Large (50-100+ apps) | r5.24xlarge | 768 GB | 100+ apps per extraction |
+| Small (1-10 apps) | r8g.4xlarge | 122 GB | Up to 10 apps per extraction |
+| Medium (10-50 apps) | r8g.16xlarge | 488 GB | Up to 50 apps per extraction |
+| Large (50-100+ apps) | r8g.24xlarge | 732 GB | 100+ apps per extraction |
 
 #### Security Group
 
@@ -435,7 +435,7 @@ Every time you spin up a new EMR cluster, you need to:
 | `spark-submit: command not found` | Not an EMR cluster | Use an EMR on EC2 cluster, not a plain EC2 instance |
 | `Loaded 0 JSON files` | Wrong S3 path or no event logs | Verify path with `aws s3 ls s3://your-bucket/prefix/` |
 
-### Performance Benchmarks (r5.24xlarge, 10 apps)
+### Performance Benchmarks (r8g.24xlarge, 10 apps)
 
 | Phase | Time | Peak Memory |
 |---|---|---|
