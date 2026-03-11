@@ -55,6 +55,7 @@ Analyzes Spark event logs from EMR on EC2 or EMR Serverless and generates optimi
 |--------|---------|
 | `spark_extractor.py` | Extracts metrics from Spark event logs using PySpark |
 | `python_extractor.py` | Extracts metrics from Spark event logs using pure Python (no Spark required) |
+| `pipeline_wrapper.py` | End-to-end orchestrator: extract → recommend → format (no Spark required) |
 | `lambda_orchestrator.py` | Lambda function that submits parallel EMR Serverless jobs |
 | `emr_recommender.py` | Generates cost/performance optimized Spark configurations |
 | `write_to_iceberg.py` | Writes metrics + recommendations to Iceberg table via Spark |
@@ -119,6 +120,27 @@ python3 python_extractor.py \
 ```
 
 Output format is identical to `spark_extractor.py` and works with `emr_recommender.py`.
+
+### Option 4: End-to-End Pipeline (no Spark required)
+
+Run all three stages (extract → recommend → format) in one command:
+
+```bash
+python3 pipeline_wrapper.py \
+  --input s3://your-bucket/event-logs/ \
+  --output s3://your-bucket/extracted/ \
+  --format-job-config
+```
+
+Skip extraction to re-run recommendations on existing data:
+
+```bash
+python3 pipeline_wrapper.py \
+  --input s3://your-bucket/event-logs/ \
+  --output s3://your-bucket/extracted/ \
+  --skip-extraction \
+  --format-job-config
+```
 
 ## Extracted Metrics
 
@@ -232,8 +254,28 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--output` | Output path for extracted metrics | *required* |
 | `--limit` | Max applications to process | 100 |
 | `--single-app` | Input path is a single app (not a directory of apps) | false |
-| `--workers` | Parallel processing workers | 4 |
+| `--workers` | Parallel processing workers | 20 |
 | `--profile` | AWS profile name for S3 access | default |
+
+### pipeline_wrapper.py
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input` | S3 or local path to event logs | *required* |
+| `--output` | Output path for extracted metrics (S3 or local) | *required* |
+| `--limit` | Max applications to process | 100 |
+| `--workers` | Parallel workers for extraction | 20 |
+| `--profile` | AWS profile name | default |
+| `--single-app` | Treat `--input` as a single app path | false |
+| `--region` | AWS region | us-east-1 |
+| `--target-partition-size` | Target shuffle partition size in MiB | 1024 |
+| `--results` | Output filename for recommendations | recommendations.json |
+| `--format-job-config` | Also format output to EMR Serverless job config JSON | false |
+| `--cost-optimized` | Generate only cost-optimized recommendations | both |
+| `--performance-optimized` | Generate only performance-optimized recommendations | both |
+| `--individual-files` | Generate individual JSON files per job | single file |
+| `--write-to-iceberg-table` | Write recommendations to Iceberg table (`catalog.database.table`) | — |
+| `--skip-extraction` | Skip extraction step, use existing data in `--output` | false |
 
 ### emr_recommender.py
 
@@ -248,6 +290,13 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--format-job-config` | Deployment-ready format | standard |
 | `--target-partition-size` | Shuffle partition size in MiB | 1024 |
 | `--limit` | Max applications | 100 |
+
+### format_to_job_config.py
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input` | Input recommendations JSON file | *required* |
+| `--output` | Output job config JSON file | *required* |
 
 ### write_to_iceberg.py
 
