@@ -272,7 +272,8 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             if shuffle_bytes > 0:
                 partitions = int((shuffle_bytes / (target_mib * 1024 * 1024)) + 0.5)
             else:
-                partitions = 200
+                # Scale by input size (128MB per partition) instead of flat 200
+                partitions = max(2, min(200, int(i_in_gb / 0.128)))
             if partitions % 2 != 0:
                 partitions += 1
             return partitions, target_mib
@@ -399,6 +400,9 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         app_id = row.get('application_id', 'N/A')
         name = row.get('application_name', 'N/A')
         
+        max_exec_minimal = 2
+        min_exec_minimal = 1
+        
         minimal_rec = {
             "application_id": app_id,
             "application_name": name,
@@ -412,8 +416,8 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
                 "type": "Small",
                 "vcpu": 1,
                 "memory_gb": 2,
-                "max_executors": 2,
-                "min_executors": 1,
+                "max_executors": max_exec_minimal,
+                "min_executors": min_exec_minimal,
                 "total_vcpu_capacity": 2,
                 "total_memory_capacity": 4
             },
@@ -422,11 +426,11 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
                 "spark.driver.memory": "2G",
                 "spark.executor.cores": "1",
                 "spark.executor.memory": "2g",
-                "spark.executor.instances": "2",
+                "spark.executor.instances": str(max_exec_minimal),
                 "spark.dynamicAllocation.enabled": "true",
-                "spark.dynamicAllocation.maxExecutors": "2",
-                "spark.dynamicAllocation.minExecutors": "1",
-                "spark.dynamicAllocation.initialExecutors": "1",
+                "spark.dynamicAllocation.maxExecutors": str(max_exec_minimal),
+                "spark.dynamicAllocation.minExecutors": str(min_exec_minimal),
+                "spark.dynamicAllocation.initialExecutors": str(min_exec_minimal),
                 "spark.hadoop.fs.s3a.connection.ssl.enabled": "true",
                 "spark.sql.catalog.spark_catalog": "org.apache.iceberg.spark.SparkSessionCatalog",
                 "spark.sql.catalog.spark_catalog.type": "hive",
