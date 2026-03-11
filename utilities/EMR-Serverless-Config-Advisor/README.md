@@ -35,8 +35,8 @@ Event Logs (S3 or Local)
         │
         ▼
 ┌─────────────────────────────┐
-│  Stage 1: spark_processor   │  Extract 18 metrics per app
-│  (20 parallel workers)      │  Supports .zst, .gz, .lz4
+│  Stage 1: Metric Extraction │  Extract 18 metrics per app
+│  Python or Spark (auto)     │  Supports .zst, .gz, .lz4
 └─────────────────────────────┘
         │
         ▼
@@ -48,6 +48,22 @@ Event Logs (S3 or Local)
         ▼
   JSON recommendations
   (or Iceberg table)
+```
+
+### Extraction Engines
+
+The pipeline automatically selects the best extraction engine:
+
+| Engine | When Used | Best For |
+|--------|-----------|----------|
+| **Python** (`spark_processor.py`) | Default, always available | Small/medium workloads, local runs |
+| **Spark** (`spark_extractor.py`) | Auto-detected when `spark-submit` is available | Large-scale (1000s of logs), EMR clusters |
+
+The Spark extractor uses a two-phase approach:
+1. **Phase A**: Python decompresses event logs from S3 in parallel (50 threads)
+2. **Phase B**: Spark reads decompressed JSON and extracts metrics using DataFrame APIs
+
+Both engines produce identical metrics and recommendations. On EMR clusters, the pipeline auto-detects `spark-submit` and uses the Spark engine. If Spark extraction fails, it falls back to Python automatically.
 ```
 
 The recommender analyzes input/output data volumes, shuffle patterns, memory utilization, CPU usage, spill ratios, and task statistics to determine:
@@ -90,7 +106,7 @@ All flags from `emr_recommender.py` plus:
 
 Legacy S3 flags (`--input-bucket`, `--input-prefix`, `--staging-bucket`, `--staging-prefix`) are still supported for backward compatibility.
 
-### spark_processor.py
+### spark_processor.py (Python extraction)
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -99,6 +115,21 @@ Legacy S3 flags (`--input-bucket`, `--input-prefix`, `--staging-bucket`, `--stag
 | `--output-bucket` | S3 bucket for metrics output | — |
 | `--output-prefix` | S3 prefix for metrics output | — |
 | `--last-hours` | Only process logs modified in last N hours | all |
+
+### spark_extractor.py (Spark extraction)
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input` | S3 path to event logs | *required* |
+| `--output` | Output path for extracted metrics | *required* |
+| `--limit` | Max applications to process | 100 |
+| `--decompress-workers` | Parallel download threads for Phase A | 50 |
+
+Run directly with `spark-submit`:
+```bash
+spark-submit --master local[*] --conf spark.driver.memory=32g \
+  spark_extractor.py --input s3://bucket/event-logs/ --output /tmp/staging/
+```
 
 ---
 
@@ -148,17 +179,31 @@ python3 emr_recommender.py \
 # /deploy/configs/2-UserAttributeStore.json
 ```
 
-### Run on EMR cluster (large-scale)
+### Run on EMR cluster (large-scale, auto-uses Spark)
 ```bash
 scp *.py hadoop@your-emr-master:~/
 ssh -i key.pem hadoop@your-emr-master
 pip3 install zstandard pandas
 
-nohup python3 pipeline_wrapper.py \
+# Pipeline auto-detects spark-submit and uses Spark extractor
+python3 pipeline_wrapper.py \
   --input-path s3://bucket/event-logs/ \
   --output-path s3://bucket/staging/ \
-  --output recommendations.json \
-  > pipeline.log 2>&1 &
+  --output recommendations.json
+```
+
+### Run Spark extractor directly
+```bash
+spark-submit --master local[*] --conf spark.driver.memory=32g \
+  spark_extractor.py \
+  --input s3://bucket/event-logs/ \
+  --output /tmp/staging/ \
+  --limit 200
+
+python3 emr_recommender.py \
+  --input-path /tmp/staging/ \
+  --output-cost cost.json \
+  --format-job-config
 ```
 
 ---
@@ -319,6 +364,7 @@ Tunable constants in source files:
 | `MAX_WORKERS` | spark_processor.py | 20 | Parallel extraction threads |
 | `MAX_CONCURRENT_UPLOADS` | spark_processor.py | 20 | S3 upload concurrency |
 | `TARGET_PARTITION_SIZE_MIB` | emr_recommender.py | 1024 | Shuffle partition target |
+| `--decompress-workers` | spark_extractor.py | 50 | S3 download threads (Phase A) |
 
 ---
 

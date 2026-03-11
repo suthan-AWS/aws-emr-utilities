@@ -66,32 +66,49 @@ def phase_a_decompress(input_path, local_base, limit, workers=50):
 
     s3 = boto3.client("s3", region_name="us-east-1")
 
-    # List application directories
+    # List application directories and files
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/")
-    app_prefixes = []
+    app_prefixes = []  # (prefix, app_name, is_rolling)
+    
+    # Check for eventlog_v2_ directories (EMR Serverless rolling logs)
     for cp in resp.get("CommonPrefixes", []):
         p = cp["Prefix"]
         name = p.rstrip("/").rsplit("/", 1)[-1]
         if name.startswith("eventlog_v2_"):
-            app_prefixes.append((p, name))
-
-    # If no subdirectories found, check if the prefix itself is an app directory
+            app_prefixes.append((p, name, True))
+    
+    # Check for application_ directories (EMR on EC2 single-file logs)
+    if not app_prefixes:
+        for cp in resp.get("CommonPrefixes", []):
+            p = cp["Prefix"]
+            name = p.rstrip("/").rsplit("/", 1)[-1]
+            if name.startswith("application_"):
+                app_prefixes.append((p, name, False))
+    
+    # If no subdirectories, check if prefix itself is an app directory
     if not app_prefixes:
         dir_name = prefix.rstrip("/").rsplit("/", 1)[-1]
         if dir_name.startswith("eventlog_v2_"):
-            app_prefixes.append((prefix, dir_name))
+            app_prefixes.append((prefix, dir_name, True))
+        elif dir_name.startswith("application_"):
+            app_prefixes.append((prefix, dir_name, False))
 
     app_prefixes = app_prefixes[:limit]
 
     # List ALL files across all apps in one pass
     all_tasks = []  # (bucket, key, app_name)
-    for app_prefix, app_name in app_prefixes:
+    for app_prefix, app_name, is_rolling in app_prefixes:
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=app_prefix):
             for obj in page.get("Contents", []):
                 k = obj["Key"]
-                if "/events_" in k:
-                    all_tasks.append((bucket, k, app_name))
+                if is_rolling:
+                    if "/events_" in k:
+                        all_tasks.append((bucket, k, app_name))
+                else:
+                    # Single-file event logs — skip directories
+                    if not k.endswith("/"):
+                        all_tasks.append((bucket, k, app_name))
 
     print(f"Phase A: Decompressing {len(app_prefixes)} apps, {len(all_tasks)} files with {workers} threads")
     os.makedirs(local_base, exist_ok=True)
@@ -99,7 +116,7 @@ def phase_a_decompress(input_path, local_base, limit, workers=50):
     # Open output files
     app_files = {}
     app_counts = {}
-    for _, app_name in app_prefixes:
+    for _, app_name, _ in app_prefixes:
         d = os.path.join(local_base, app_name)
         os.makedirs(d, exist_ok=True)
         app_files[app_name] = open(os.path.join(d, "events.jsonl"), "w")
