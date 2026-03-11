@@ -1,90 +1,111 @@
-"""Write recommendations to an Iceberg table via Athena."""
-import json
-import time
-import logging
+#!/usr/bin/env python3
+"""Write recommendations + metrics to an Iceberg table via Spark.
 
-log = logging.getLogger("dual-mode-recommender")
+Usage:
+  spark-submit write_to_iceberg.py \
+    --rec-path /path/to/cost_recs.json \
+    --extract-path s3://bucket/prefix/  (contains task_stage_summary/*.json) \
+    --table glue_catalog.db.table \
+    --warehouse s3://bucket/iceberg/
+"""
+import argparse, json, os, sys
+from datetime import datetime
+from pyspark.sql import SparkSession, Row
+from pyspark.sql.types import *
 
 
-def _run_athena_query(athena, query, database, workgroup="V3"):
-    """Execute an Athena query and wait for completion."""
-    resp = athena.start_query_execution(
-        QueryString=query,
-        QueryExecutionContext={"Database": database, "Catalog": "AwsDataCatalog"},
-        WorkGroup=workgroup,
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rec-path", required=True, help="Path to recommendation JSON file (list of recs)")
+    parser.add_argument("--extract-path", required=True, help="Path containing task_stage_summary/ dir")
+    parser.add_argument("--table", required=True, help="Iceberg table: catalog.database.table")
+    parser.add_argument("--warehouse", default="s3://suthan-event-logs/iceberg/")
+    args = parser.parse_args()
+
+    catalog, database, table = args.table.split(".")
+    full_table = f"{catalog}.{database}.{table}"
+
+    spark = (SparkSession.builder
+        .appName("write-to-iceberg")
+        .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
+        .config(f"spark.sql.catalog.{catalog}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+        .config(f"spark.sql.catalog.{catalog}.warehouse", args.warehouse)
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        .getOrCreate()
     )
-    qid = resp["QueryExecutionId"]
 
-    while True:
-        status = athena.get_query_execution(QueryExecutionId=qid)
-        state = status["QueryExecution"]["Status"]["State"]
-        if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
-            break
-        time.sleep(1)
+    # Load recommendations
+    if args.rec_path.startswith("s3://"):
+        import boto3
+        p = args.rec_path.replace("s3://", "").split("/", 1)
+        body = boto3.client("s3").get_object(Bucket=p[0], Key=p[1])["Body"].read()
+        recs = json.loads(body)
+    else:
+        recs = json.load(open(args.rec_path))
 
-    if state != "SUCCEEDED":
-        reason = status["QueryExecution"]["Status"].get("StateChangeReason", "")
-        raise RuntimeError(f"Athena query {state}: {reason}\nSQL: {query[:200]}")
-    return qid
+    # Load task_stage_summary extracts keyed by application_id
+    extract_dir = args.extract_path.rstrip("/") + "/task_stage_summary/"
+    extracts = {}
+    if extract_dir.startswith("s3://"):
+        import boto3
+        p = extract_dir.replace("s3://", "").split("/", 1)
+        s3 = boto3.client("s3")
+        resp = s3.list_objects_v2(Bucket=p[0], Prefix=p[1])
+        for obj in resp.get("Contents", []):
+            if obj["Key"].endswith(".json"):
+                body = s3.get_object(Bucket=p[0], Key=obj["Key"])["Body"].read()
+                d = json.loads(body)
+                extracts[d.get("application_id", "")] = d
+    else:
+        import glob as g
+        for f in g.glob(os.path.join(extract_dir, "*.json")):
+            d = json.load(open(f))
+            extracts[d.get("application_id", "")] = d
+
+    # Build rows
+    now = datetime.utcnow().isoformat()
+    rows = []
+    for rec in recs:
+        app_id = rec.get("application_id", rec.get("job_id", "unknown"))
+        ext = extracts.get(app_id, {})
+        m = rec.get("metrics", {})
+        es = ext.get("executor_summary", {})
+        sd = ext.get("shuffle_data_summary", {})
+        io = ext.get("io_summary", {}).get("application_level", {})
+        ai = ext.get("application_info", {})
+
+        rows.append(Row(
+            job_id=str(ai.get("job_id", rec.get("job_id", ""))),
+            application_name=str(rec.get("application_name", "")),
+            app_id=str(ai.get("app_id", app_id)),
+            optimization_mode=str(rec.get("optimization_mode", "")),
+            input_gb=float(io.get("total_input_gb", 0) or 0),
+            shuffle_read_gb=float(io.get("total_shuffle_read_gb", 0) or 0),
+            shuffle_write_gb=float(io.get("total_shuffle_write_gb", 0) or 0),
+            peak_shuffle_write_per_stage=float(sd.get("max_stage_shuffle_write_gb", 0) or 0),
+            peak_disk_spill_per_stage=float(sd.get("max_stage_disk_spill_gb", 0) or 0),
+            duration_hours=float(ext.get("total_run_duration_hours", 0) or 0),
+            duration_minutes=float(ext.get("total_run_duration_minutes", 0) or 0),
+            avg_memory_utilization_percent=float(es.get("avg_memory_utilization_percent", 0) or 0),
+            avg_cpu_utilization_percent=float(es.get("avg_cpu_utilization_percent", 0) or 0),
+            max_memory_utilization_percent=float(es.get("max_memory_utilization_percent", 0) or 0),
+            idle_core_percentage=float(es.get("idle_core_percentage", 0) or 0),
+            total_memory_spilled_gb=float(ext.get("spill_summary", {}).get("total_memory_spilled_gb", 0) or 0),
+            cost_factor=float(ext.get("total_cost_factor", 0) or 0),
+            src_event_log_location=str(ext.get("src_event_log_location", app_id)),
+            recommendation=json.dumps(rec),
+            created_at=now,
+        ))
+
+    df = spark.createDataFrame(rows)
+
+    # Create table if not exists, then append
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {catalog}.{database}")
+    df.writeTo(full_table).using("iceberg").createOrReplace()
+
+    print(f"✅ Wrote {len(rows)} rows to {full_table}")
+    spark.stop()
 
 
-def _escape(s):
-    """Escape single quotes for SQL."""
-    return str(s).replace("'", "''")
-
-
-def write_to_iceberg(recommendations, table_path, region="us-east-1"):
-    """Write recommendations to Iceberg table via Athena.
-
-    Args:
-        recommendations: list of recommendation dicts
-        table_path: catalog.database.table (e.g. AwsDataCatalog.common.emr-serverless-config-advisor)
-        region: AWS region
-    """
-    import boto3
-    from format_to_job_config import format_to_job_config
-
-    parts = table_path.split(".")
-    if len(parts) != 3:
-        raise ValueError(f"Expected catalog.database.table, got: {table_path}")
-    _, database, table = parts
-
-    athena = boto3.client("athena", region_name=region)
-
-    # Create table if not exists
-    s3_location = f"s3://suthan-event-logs/iceberg/{database}/{table}/"
-    create_sql = f"""
-    CREATE TABLE IF NOT EXISTS `{database}`.`{table}` (
-        job_id string,
-        application_name string,
-        optimization_mode string,
-        recommendation string,
-        created_at timestamp
-    )
-    LOCATION '{s3_location}'
-    TBLPROPERTIES ('table_type'='ICEBERG')
-    """
-    log.info("Ensuring table %s.%s exists", database, table)
-    _run_athena_query(athena, create_sql, database)
-
-    # Build batch INSERT with UNION ALL
-    selects = []
-    for rec in recommendations:
-        job_config = format_to_job_config(rec) if "spark_configs" in rec else rec
-        job_id = _escape(rec.get("job_id", rec.get("application_id", "unknown")))
-        app_name = _escape(rec.get("application_name", "unknown"))
-        mode = _escape(rec.get("optimization_mode", "unknown"))
-        rec_json = _escape(json.dumps(job_config))
-        selects.append(
-            f"SELECT '{job_id}', '{app_name}', '{mode}', '{rec_json}', current_timestamp"
-        )
-
-    batch_size = 20
-    for i in range(0, len(selects), batch_size):
-        batch = selects[i:i + batch_size]
-        union_sql = " UNION ALL ".join(batch)
-        insert_sql = f'INSERT INTO "{database}"."{table}" {union_sql}'
-        _run_athena_query(athena, insert_sql, database)
-        log.info("Inserted batch %d-%d of %d", i + 1, min(i + batch_size, len(selects)), len(selects))
-
-    log.info("Wrote %d recommendations to %s.%s", len(recommendations), database, table)
+if __name__ == "__main__":
+    main()
