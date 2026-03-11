@@ -598,24 +598,45 @@ def extract_executor_summary(events):
             executor_info = event.get("Executor Info", {})
             add_timestamp = event.get("Timestamp")
 
-            executors[executor_id] = {
-                "executor_id": executor_id,
-                "host": executor_info.get("Host", "N/A"),
-                "total_cores": executor_info.get("Total Cores", 0),
-                "add_time": datetime.fromtimestamp(add_timestamp / 1000).isoformat() if add_timestamp else None,
-                "_add_timestamp_ms": add_timestamp,  # Internal for calculation
-                "remove_time": None,
-                "remove_reason": None,
-                "status": "active",
-                "uptime_hours": 0,
-                "total_input_bytes": 0,
-                "total_shuffle_read": 0,
-                "total_shuffle_write": 0,
-                "peak_memory_gb": 0,
-                "peak_memory_bytes": 0
-            }
+            if executor_id not in executors:
+                executors[executor_id] = {
+                    "executor_id": executor_id,
+                    "host": "N/A",
+                    "total_cores": 0,
+                    "add_time": None,
+                    "_add_timestamp_ms": None,
+                    "remove_time": None,
+                    "remove_reason": None,
+                    "status": "active",
+                    "uptime_hours": 0,
+                    "total_input_bytes": 0,
+                    "total_shuffle_read": 0,
+                    "total_shuffle_write": 0,
+                    "peak_memory_gb": 0,
+                    "peak_memory_bytes": 0,
+                }
+            # Update metadata (safe even if entry already exists from early removal)
+            executors[executor_id]["host"] = executor_info.get("Host", "N/A")
+            executors[executor_id]["total_cores"] = executor_info.get("Total Cores", 0)
+            executors[executor_id]["add_time"] = datetime.fromtimestamp(add_timestamp / 1000).isoformat() if add_timestamp else None
+            executors[executor_id]["_add_timestamp_ms"] = add_timestamp
+            # Recompute uptime if removal already recorded
+            rm_ts = executors[executor_id].get("_remove_timestamp_ms")
+            if rm_ts and add_timestamp:
+                executors[executor_id]["uptime_hours"] = round(
+                    (rm_ts - add_timestamp) / (1000 * 60 * 60), 2)
         elif event.get("Event") == "SparkListenerExecutorRemoved":
             executor_id = event.get("Executor ID")
+            if executor_id and executor_id not in executors:
+                # Out-of-order: removed before added — create stub
+                executors[executor_id] = {
+                    "executor_id": executor_id, "host": "N/A",
+                    "total_cores": 0, "add_time": None, "_add_timestamp_ms": None,
+                    "remove_time": None, "remove_reason": None, "status": "active",
+                    "uptime_hours": 0, "total_input_bytes": 0,
+                    "total_shuffle_read": 0, "total_shuffle_write": 0,
+                    "peak_memory_gb": 0, "peak_memory_bytes": 0,
+                }
             if executor_id in executors:
                 remove_timestamp = event.get("Timestamp")
                 executors[executor_id]["remove_time"] = datetime.fromtimestamp(
