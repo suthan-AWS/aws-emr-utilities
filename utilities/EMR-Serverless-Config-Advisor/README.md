@@ -1,351 +1,239 @@
 # EMR Serverless Config Advisor
 
-Analyzes Spark event logs and generates optimized EMR Serverless configurations. Works with both EMR on EC2 and EMR Serverless event logs.
+Analyzes Spark event logs from EMR on EC2 or EMR Serverless and generates optimized configurations with cost and performance recommendations.
+
+## Architecture
+
+```
+┌──────────────┐         ┌──────────────────────────────────────────────────────┐
+│   User /CI   │         │                    AWS Cloud                         │
+│              │         │                                                      │
+│  Invoke      │────────▶│  ┌─────────────────────┐                             │
+│  Lambda      │         │  │  Lambda Orchestrator │                             │
+│              │         │  │  (lambda_orchestrator │                             │
+│              │         │  │   .py)                │                             │
+│              │         │  └────────┬─────────────┘                             │
+│              │         │           │ Submits 1 job per app (parallel)          │
+│              │         │           ▼                                           │
+│              │         │  ┌─────────────────────────────────────┐              │
+│              │         │  │       EMR Serverless Application     │              │
+│              │         │  │                                      │              │
+│              │         │  │  ┌──────────────┐ ┌──────────────┐  │              │
+│              │         │  │  │spark_extractor│ │spark_extractor│  │              │
+│              │         │  │  │  (App 1)     │ │  (App 2)     │  │              │
+│              │         │  │  └──────┬───────┘ └──────┬───────┘  │              │
+│              │         │  │         │    ...N jobs    │          │              │
+│              │         │  └─────────┼────────────────┼──────────┘              │
+│              │         │            ▼                ▼                         │
+│              │         │  ┌──────────────────────────────────┐                 │
+│              │         │  │            Amazon S3              │                 │
+│              │         │  │                                   │                 │
+│              │         │  │  /event-logs/        (input)      │                 │
+│              │         │  │  /task_stage_summary/ (extract)   │                 │
+│              │         │  │  /spark_config/       (configs)   │                 │
+│              │         │  │  /iceberg/            (table)     │                 │
+│              │         │  └──────────────────────────────────┘                 │
+│              │         │            │                                          │
+│              │         │            ▼                                          │
+│              │         │  ┌──────────────────┐  ┌───────────────────┐          │
+│              │         │  │ emr_recommender.py│─▶│write_to_iceberg.py│          │
+│              │         │  │ (cost + perf)     │  │ (Spark + Glue)    │          │
+│              │         │  └──────────────────┘  └───────────────────┘          │
+│              │         │                                                      │
+└──────────────┘         └──────────────────────────────────────────────────────┘
+```
+
+**Flow:**
+1. Lambda orchestrator lists event log apps in S3, submits one EMR Serverless job per app (parallel)
+2. Each `spark_extractor.py` job reads compressed event logs, extracts 80+ metrics per app
+3. `emr_recommender.py` reads extracted metrics, generates cost/performance Spark configs
+4. `write_to_iceberg.py` (optional) writes metrics + recommendations to an Iceberg table via Spark
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `spark_extractor.py` | Extracts metrics from Spark event logs using PySpark |
+| `lambda_orchestrator.py` | Lambda function that submits parallel EMR Serverless jobs |
+| `emr_recommender.py` | Generates cost/performance optimized Spark configurations |
+| `write_to_iceberg.py` | Writes metrics + recommendations to Iceberg table via Spark |
+| `format_to_job_config.py` | Formats recommendations into EMR Serverless job config format |
 
 ## Quick Start
 
+### Option 1: Lambda + EMR Serverless (recommended)
+
+Deploy `lambda_orchestrator.py` as a Lambda function, then invoke:
+
 ```bash
-pip install boto3 zstandard pandas
+aws lambda invoke \
+  --function-name your-lambda-function \
+  --payload '{
+    "input_path": "s3://your-bucket/event-logs/",
+    "output_path": "s3://your-bucket/advisor-output/",
+    "application_id": "YOUR_EMR_SERVERLESS_APP_ID",
+    "execution_role": "arn:aws:iam::ACCOUNT:role/YourRole",
+    "script_path": "s3://your-bucket/scripts/spark_extractor.py",
+    "archives_path": "s3://your-bucket/scripts/zstandard.zip"
+  }' \
+  --cli-read-timeout 910 \
+  output.json
 ```
 
-**Option A — Full pipeline** (event logs → metrics → recommendations):
-```bash
-python3 pipeline_wrapper.py \
-  --input-path s3://YOUR_BUCKET/event-logs/ \
-  --output-path s3://YOUR_BUCKET/staging/ \
-  --output recommendations.json
-```
+Then generate recommendations:
 
-**Option B — Recommendations only** (from pre-extracted metrics):
 ```bash
 python3 emr_recommender.py \
-  --input-path s3://YOUR_BUCKET/staging/ \
+  --input-path s3://your-bucket/advisor-output/ \
   --output-cost cost.json \
   --output-perf perf.json
 ```
 
-Both commands work with local paths too — just use a directory path instead of `s3://`.
+### Option 2: Direct spark-submit
 
----
-
-## How It Works
-
-```
-Event Logs (S3 or Local)
-        │
-        ▼
-┌─────────────────────────────┐
-│  Stage 1: spark_processor   │  Extract 18 metrics per app
-│  (20 parallel workers)      │  Supports .zst, .gz, .lz4
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│  Stage 2: emr_recommender   │  Generate Spark configs
-│  (cost + performance modes) │  Worker type, executors, shuffle
-└─────────────────────────────┘
-        │
-        ▼
-  JSON recommendations
-  (or Iceberg table)
+```bash
+spark-submit --master local[*] --driver-memory 32g \
+  spark_extractor.py \
+  --input s3://your-bucket/event-logs/ \
+  --output /tmp/output/
 ```
 
-The recommender analyzes input/output data volumes, shuffle patterns, memory utilization, CPU usage, spill ratios, and task statistics to determine:
+## Extracted Metrics
 
-- **Worker type**: Small (2 vCPU/16 GB) → XLarge (32 vCPU/256 GB)
-- **Executor count**: min/max for dynamic allocation
-- **Shuffle partitions**: Based on data volume and target partition size
-- **Complete Spark config**: Ready for EMR Serverless deployment
+Each app produces a JSON with these sections:
 
----
+| Section | Key Fields |
+|---------|------------|
+| `task_summary` | total/completed/failed/killed tasks, success rate |
+| `stage_summary` | per-stage shuffle read/write, spill, duration, failure reasons |
+| `executor_summary` | 20 fields per executor: cores, memory, uptime, utilization, cost factor |
+| `io_summary` | total input/output/shuffle read/write in GB |
+| `spill_summary` | memory + disk spill totals and percentages |
+| `shuffle_data_summary` | peak stage shuffle write, EMR Serverless storage eligibility (200GB limit) |
+| `driver_metrics` | GC stats, off-heap memory, tasks/jobs/stages launched |
+| `job_details` | per-job duration, status, stage mapping |
+| `sql_metrics` | per-SQL execution plan, duration, status |
+
+## Recommendation Modes
+
+| Mode | Strategy | Best For |
+|------|----------|----------|
+| Cost | Conservative scaling (0.5–1.5× base) | Dev/test, budget workloads |
+| Performance | Aggressive scaling for memory-stressed jobs | Production SLA-critical |
+
+## Write to Iceberg Table
+
+### Option A: Let the script create the table
+
+```bash
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,software.amazon.awssdk:bundle:2.28.11,software.amazon.awssdk:url-connection-client:2.28.11 \
+  write_to_iceberg.py \
+  --rec-path s3://your-bucket/recommendations/cost.json \
+  --extract-path s3://your-bucket/advisor-output/ \
+  --table glue_catalog.your_database.config_advisor \
+  --warehouse s3://your-bucket/iceberg/
+```
+
+### Option B: Create the table yourself first
+
+Use this DDL in Athena (V3 engine) or Spark SQL:
+
+```sql
+CREATE TABLE IF NOT EXISTS your_database.config_advisor (
+    job_id                          STRING,
+    application_name                STRING,
+    app_id                          STRING,
+    optimization_mode               STRING,
+    input_gb                        DOUBLE,
+    shuffle_read_gb                 DOUBLE,
+    shuffle_write_gb                DOUBLE,
+    peak_shuffle_write_per_stage    DOUBLE,
+    peak_disk_spill_per_stage       DOUBLE,
+    duration_hours                  DOUBLE,
+    duration_minutes                DOUBLE,
+    avg_memory_utilization_percent  DOUBLE,
+    avg_cpu_utilization_percent     DOUBLE,
+    max_memory_utilization_percent  DOUBLE,
+    idle_core_percentage            DOUBLE,
+    total_memory_spilled_gb         DOUBLE,
+    cost_factor                     DOUBLE,
+    src_event_log_location          STRING,
+    recommendation                  STRING,
+    created_at                      STRING
+)
+USING iceberg
+LOCATION 's3://your-bucket/iceberg/your_database/config_advisor/'
+```
+
+Then run `write_to_iceberg.py` — it will detect the existing table and append data.
+
+### Query Examples
+
+```sql
+-- Latest recommendations
+SELECT job_id, application_name, input_gb, duration_hours,
+       peak_shuffle_write_per_stage, cost_factor
+FROM your_database.config_advisor
+ORDER BY created_at DESC;
+
+-- Jobs exceeding Serverless storage limit (200GB)
+SELECT job_id, application_name, peak_shuffle_write_per_stage
+FROM your_database.config_advisor
+WHERE peak_shuffle_write_per_stage > 200;
+
+-- High memory utilization jobs
+SELECT job_id, application_name, avg_memory_utilization_percent,
+       max_memory_utilization_percent, total_memory_spilled_gb
+FROM your_database.config_advisor
+WHERE max_memory_utilization_percent > 85
+ORDER BY total_memory_spilled_gb DESC;
+```
 
 ## CLI Reference
+
+### spark_extractor.py
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input` | S3 path or local path to event logs | *required* |
+| `--output` | Output path for extracted metrics | *required* |
+| `--limit` | Max applications to process | 100 |
+| `--single-app` | Input path is a single app (not a directory of apps) | false |
+| `--decompress-workers` | Parallel S3 download threads | 50 |
 
 ### emr_recommender.py
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--input-path` | Local dir or S3 path with metrics | *required* |
+| `--input-path` | Path with extracted metrics (local or S3) | *required* |
 | `--output-cost` | Output file for cost-optimized recs | — |
 | `--output-perf` | Output file for performance-optimized recs | — |
 | `--cost-optimized` | Generate only cost recommendations | both |
 | `--performance-optimized` | Generate only performance recommendations | both |
-| `--individual-files` | One JSON per job (`1-jobname.json`) | single file |
+| `--individual-files` | One JSON per job | single file |
 | `--format-job-config` | Deployment-ready format | standard |
-| `--write-to-iceberg-table` | Write to Iceberg table (`catalog.db.table`) | — |
 | `--target-partition-size` | Shuffle partition size in MiB | 1024 |
-| `--limit` | Max applications to process | 100 |
-| `--region` | AWS region (for S3/Iceberg) | us-east-1 |
+| `--limit` | Max applications | 100 |
 
-### pipeline_wrapper.py
-
-All flags from `emr_recommender.py` plus:
+### write_to_iceberg.py
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--output-path` | Local dir or S3 path for metrics output | — |
-| `--output` | Filename for recommendations | — |
-| `--last-hours` | Only process logs modified in last N hours | all |
-| `--skip-extraction` | Skip Stage 1, use existing metrics | false |
-
-Legacy S3 flags (`--input-bucket`, `--input-prefix`, `--staging-bucket`, `--staging-prefix`) are still supported for backward compatibility.
-
-### spark_processor.py
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--input-bucket` | S3 bucket with event logs | — |
-| `--input-prefix` | S3 prefix for event logs | — |
-| `--output-bucket` | S3 bucket for metrics output | — |
-| `--output-prefix` | S3 prefix for metrics output | — |
-| `--last-hours` | Only process logs modified in last N hours | all |
-
----
-
-## Common Workflows
-
-### Daily optimization (last 24 hours, cost-focused)
-```bash
-python3 pipeline_wrapper.py \
-  --input-path s3://bucket/event-logs/ \
-  --output-path s3://bucket/staging/ \
-  --output daily.json \
-  --last-hours 24 \
-  --cost-optimized \
-  --format-job-config \
-  --individual-files
-```
-
-### Weekly review (both modes)
-```bash
-python3 pipeline_wrapper.py \
-  --input-path s3://bucket/event-logs/ \
-  --output-path s3://bucket/staging/ \
-  --output weekly.json \
-  --last-hours 168
-```
-
-### Write recommendations to Iceberg for tracking
-```bash
-python3 emr_recommender.py \
-  --input-path s3://bucket/staging/ \
-  --output-cost cost.json \
-  --cost-optimized \
-  --write-to-iceberg-table AwsDataCatalog.common.emr-serverless-config-advisor
-```
-
-### Generate individual deployment configs
-```bash
-python3 emr_recommender.py \
-  --input-path ~/metrics/ \
-  --output-cost /deploy/configs/cost.json \
-  --cost-optimized \
-  --format-job-config \
-  --individual-files
-
-# Output:
-# /deploy/configs/1-DedupTripEvents.json
-# /deploy/configs/2-UserAttributeStore.json
-```
-
-### Run on EMR cluster (large-scale)
-```bash
-scp *.py hadoop@your-emr-master:~/
-ssh -i key.pem hadoop@your-emr-master
-pip3 install zstandard pandas
-
-nohup python3 pipeline_wrapper.py \
-  --input-path s3://bucket/event-logs/ \
-  --output-path s3://bucket/staging/ \
-  --output recommendations.json \
-  > pipeline.log 2>&1 &
-```
-
----
-
-## Time Filter Reference
-
-| `--last-hours` | Duration | Use Case |
-|-----------------|----------|----------|
-| 1 | Last hour | Real-time monitoring |
-| 24 | Last day | Daily optimization |
-| 168 | Last week | Weekly review |
-| 720 | Last month | Monthly analysis |
-
-Filters by S3 `LastModified` or local file mtime (UTC-aware).
-
----
-
-## Iceberg Table Output
-
-The `--write-to-iceberg-table` flag writes recommendations to an Apache Iceberg table via Amazon Athena for historical tracking.
-
-**Requirements:**
-- Athena workgroup named `V3` (engine version 3)
-- Glue database already exists
-
-**Table format:** `catalog.database.table` (e.g., `AwsDataCatalog.common.emr-serverless-config-advisor`)
-
-The table is created automatically with this schema:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| job_id | string | Spark job ID from event log |
-| application_name | string | Spark application name |
-| optimization_mode | string | cost / performance / minimal |
-| recommendation | string | Full job config as JSON |
-| created_at | timestamp | When written |
-
-**Query examples:**
-```sql
-SELECT * FROM common."emr-serverless-config-advisor"
-ORDER BY created_at DESC;
-
-SELECT job_id, application_name, recommendation
-FROM common."emr-serverless-config-advisor"
-WHERE optimization_mode = 'cost';
-```
-
----
-
-## Optimization Modes
-
-### Cost-Optimized (default)
-
-Conservative executor allocation based on resource pressure:
-
-```
-pressure = memory_util × 0.4 + cpu_util × 0.4 + spill_ratio × 0.2
-scaling_factor = 0.5 + (pressure / 100) × 1.0    → range: 0.5 to 1.5
-max_executors = base_requirement × scaling_factor
-```
-
-Best for: development, testing, budget-conscious workloads.
-
-### Performance-Optimized
-
-Adds aggressive scaling when memory utilization exceeds 75%:
-
-```
-scaling_factor = 1.0 + ((memory_util - 75) / 25) × 0.5    → range: 1.0 to 1.5
-```
-
-Results in 5–21% more executors for memory-stressed jobs. Best for: production SLA-critical workloads.
-
-### Worker Type Selection
-
-| Worker | vCPU | Memory | Selected When |
-|--------|------|--------|---------------|
-| Small | 2 | 16 GB | < 20 GB needed |
-| Medium | 4 | 32 GB | < 40 GB needed |
-| Large | 16 | 108 GB | < 120 GB needed |
-| XLarge | 32 | 256 GB | ≥ 120 GB needed |
-
-### Partition Size Tuning
-
-| `--target-partition-size` | Effect | Use Case |
-|---------------------------|--------|----------|
-| 256 | 4× partitions/executors | Extreme parallelism |
-| 512 | 2× partitions/executors | Shuffle-heavy |
-| 1024 (default) | Balanced | Most workloads |
-| 2048 | Fewer partitions | Large data, less parallelism |
-
----
-
-## Example Output
-
-### Standard recommendation
-```json
-{
-  "application_name": "data-processing-batch",
-  "optimization_mode": "cost",
-  "worker": {
-    "type": "Large",
-    "vcpu": 16,
-    "memory_gb": 108,
-    "max_executors": 191,
-    "min_executors": 95
-  },
-  "spark_configs": {
-    "spark.executor.cores": "16",
-    "spark.executor.memory": "108g",
-    "spark.executor.instances": "191",
-    "spark.dynamicAllocation.maxExecutors": "191",
-    "spark.sql.shuffle.partitions": "4938"
-  }
-}
-```
-
-### Job config format (`--format-job-config`)
-```json
-{
-  "job_name": "data-processing-batch",
-  "configuration": {
-    "type": "spark",
-    "compute_platform": "EMR_SERVERLESS",
-    "spark_conf": {
-      "spark.driver.cores": "8",
-      "spark.driver.memory": "54G",
-      "spark.executor.cores": "16",
-      "spark.executor.memory": "108g",
-      "spark.executor.instances": "191",
-      "spark.dynamicAllocation.enabled": "true",
-      "spark.dynamicAllocation.maxExecutors": "191"
-    }
-  }
-}
-```
-
----
-
-## Performance
-
-| Scenario | Input | Time | Throughput |
-|----------|-------|------|------------|
-| Large-scale (EMR cluster) | 5,887 logs, 62 apps | 12 min 25 sec | 474 files/min |
-| Small-scale (single app) | 1 log, 1 app | 63 sec | — |
-| Recommendation generation | 62 apps | 3.6 sec | — |
-
-Supports compressed formats: zstd, gzip, lz4, and uncompressed JSON.
-
----
-
-## Configuration
-
-Tunable constants in source files:
-
-| Setting | File | Default | Description |
-|---------|------|---------|-------------|
-| `MAX_WORKERS` | spark_processor.py | 20 | Parallel extraction threads |
-| `MAX_CONCURRENT_UPLOADS` | spark_processor.py | 20 | S3 upload concurrency |
-| `TARGET_PARTITION_SIZE_MIB` | emr_recommender.py | 1024 | Shuffle partition target |
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `NoCredentialsError` | Run `aws configure` or export `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` |
-| Memory errors | Reduce `MAX_WORKERS` to 10 in spark_processor.py |
-| S3 throttling | Reduce `MAX_CONCURRENT_UPLOADS` to 10 |
-| Event log parse errors | Check format — must be JSON (.gz, .zst, .lz4, or uncompressed) |
-| Iceberg INSERT fails | Ensure Athena workgroup `V3` exists with engine version 3 |
-
----
+| `--rec-path` | Path to recommendation JSON | *required* |
+| `--extract-path` | Path containing `task_stage_summary/` | *required* |
+| `--table` | Iceberg table: `catalog.database.table` | *required* |
+| `--warehouse` | S3 warehouse location | `s3://suthan-event-logs/iceberg/` |
 
 ## Prerequisites
 
-- Python 3.7+
-- AWS credentials configured
-- `pip install boto3 zstandard pandas`
-- For Iceberg output: Athena V3 workgroup + Glue database
+- Python 3.7+, `pip install boto3 zstandard pandas`
+- For Spark extraction: EMR cluster or EMR Serverless application
+- For Iceberg: Glue Catalog access, Iceberg Spark runtime JAR
 
-## Limitations
+## Legacy Scripts
 
-- Requires Spark event logs in JSON format
-- Analyzes historical logs only (not live applications)
-- Recommendations based on observed patterns
+Previous Python-based extraction scripts are in the `legacy/` folder. The Spark extractor (`spark_extractor.py`) fully replaces `spark_processor.py` with identical output and 4× faster execution.
 
 ## License
 

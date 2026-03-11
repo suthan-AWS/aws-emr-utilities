@@ -17,11 +17,13 @@ def format_to_job_config(recommendation: dict, job_name: str = None) -> dict:
         job_name = f"{app_name}-job"
     
     spark_configs = recommendation.get('spark_configs', {})
+    app_id = recommendation.get('application_id', None)
     
     # Build job configuration
     job_config = {
         "job_name": job_name,
         "job_id": None,
+        "application_id": app_id,
         "ams_app_name": app_name,
         "created_by": None,
         "configuration": {
