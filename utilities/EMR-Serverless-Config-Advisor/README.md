@@ -55,7 +55,6 @@ Analyzes Spark event logs from EMR on EC2 or EMR Serverless and generates optimi
 |--------|---------|
 | `spark_extractor.py` | Extracts metrics from Spark event logs using PySpark |
 | `lambda_orchestrator.py` | Lambda function that submits parallel EMR Serverless jobs |
-| `orchestrator.py` | YARN-based orchestrator for EMR on EC2 clusters |
 | `emr_recommender.py` | Generates cost/performance optimized Spark configurations |
 | `write_to_iceberg.py` | Writes metrics + recommendations to Iceberg table via Spark |
 | `format_to_job_config.py` | Formats recommendations into EMR Serverless job config format |
@@ -90,16 +89,7 @@ python3 emr_recommender.py \
   --output-perf perf.json
 ```
 
-### Option 2: EMR on EC2 (YARN)
-
-```bash
-python3 orchestrator.py \
-  --input s3://your-bucket/event-logs/ \
-  --output s3://your-bucket/advisor-output/ \
-  --num-executors 4 --executor-memory 4g
-```
-
-### Option 3: Direct spark-submit
+### Option 2: Direct spark-submit
 
 ```bash
 spark-submit --master local[*] --driver-memory 32g \
