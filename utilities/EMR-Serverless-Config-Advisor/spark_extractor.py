@@ -516,7 +516,7 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit,
             avg_cpu_util = float(cpu_avg_row["avg"] or 0) if cpu_avg_row else 0
 
             total_task_time_hours = float(agg_result["total_run_time"] or 0) / (1000 * 60 * 60)
-            total_core_hours = max(total_cores * total_uptime, 1)
+            total_core_hours = max(float(exec_full.agg(F.coalesce(F.sum(F.col("cores") * F.col("uptime_hours")), F.lit(0))).first()[0]), 1)
             idle_pct = max(0, round((1 - total_task_time_hours / total_core_hours) * 100, 2))
 
             executor_memory_gb = executor_memory_mb / 1024

@@ -101,7 +101,10 @@ def main():
 
     # Create table if not exists, then append
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {catalog}.{database}")
-    df.writeTo(full_table).using("iceberg").createOrReplace()
+    try:
+        df.writeTo(full_table).using("iceberg").append()
+    except Exception:
+        df.writeTo(full_table).using("iceberg").create()
 
     print(f"✅ Wrote {len(rows)} rows to {full_table}")
     spark.stop()
