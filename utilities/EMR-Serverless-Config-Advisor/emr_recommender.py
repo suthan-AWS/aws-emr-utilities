@@ -94,20 +94,32 @@ def _gb_to_gib(gb: float) -> float:
 
 def _calculate_shuffle_ratio(input_gb, read_gb, write_gb) -> float:
     if input_gb == 0:
-        return 0.0
+        return 100.0 if (read_gb + write_gb) > 0 else 0.0
     return round((read_gb + write_gb) / input_gb * 100.0, 2)
 
 
-def _select_worker_type(input_gb: float, shuffle_ratio: float) -> Tuple[str, Dict]:
+def _parse_orig_cores(spark_config: dict) -> int:
+    """Extract original executor cores from spark_config."""
+    for key in ['spark.executor.cores', 'spark.emr.default.executor.cores']:
+        val = spark_config.get(key)
+        if val:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    return 0
+
+
+def _select_worker_type(input_gb: float, shuffle_ratio: float, shuffle_gb: float = 0.0) -> Tuple[str, Dict]:
     WORKERS = {
         "Small": {"vcpu": 4, "memory": 27},
         "Medium": {"vcpu": 8, "memory": 54},
         "Large": {"vcpu": 16, "memory": 108},
     }
-    
-    if input_gb > 2048 or shuffle_ratio > 70:
+    data_gb = max(input_gb, shuffle_gb)
+    if data_gb > 2048 or shuffle_ratio > 70:
         return "Large", WORKERS["Large"]
-    elif input_gb > 500 or shuffle_ratio > 40:
+    elif data_gb > 500 or shuffle_ratio > 40:
         return "Medium", WORKERS["Medium"]
     else:
         return "Small", WORKERS["Small"]
@@ -116,10 +128,21 @@ def _select_worker_type(input_gb: float, shuffle_ratio: float) -> Tuple[str, Dic
 def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
                         mem_pct: float = 60.0, cpu_pct: float = 50.0,
                         idle_pct: float = 50.0, spill_gb: float = 0.0,
-                        mode: str = "cost") -> Tuple[int, int]:
+                        mode: str = "cost", active_executors: int = 0,
+                        orig_cores_per_executor: int = 0) -> Tuple[int, int]:
     req_input = max(1, int(input_gb / 100))
     req_part = max(1, int((partitions / vcpu) / 3)) if partitions > 0 else 0
-    base_req = max(req_input, req_part)
+    if active_executors > 0:
+        if orig_cores_per_executor > 0:
+            # Scale by core ratio: original total vCPUs → recommended executor size
+            req_actual = max(1, (active_executors * orig_cores_per_executor) // vcpu)
+        else:
+            # Unknown original size — conservative estimate
+            divisor = 3 if mode == "cost" else 2
+            req_actual = max(1, active_executors // divisor)
+    else:
+        req_actual = 0
+    base_req = max(req_input, req_part, req_actual)
     
     if mode == "performance":
         if mem_pct > 75:
@@ -227,6 +250,9 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'idle_core_percentage': util_data.get('idle_core_percentage'),
             'total_memory_spilled_gb': spill_data.get('total_memory_spilled_gb'),
             'total_disk_spilled_gb': spill_data.get('total_disk_spilled_gb'),
+            'total_executors': util_data.get('total_executors', 0),
+            'active_executors': util_data.get('active_executors', 0),
+            'orig_cores_per_executor': _parse_orig_cores(data.get('spark_config', {})),
         }
         flattened.append(flat)
     
@@ -235,9 +261,10 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
     # Sanitize NaN values - replace with 0 for numeric columns
     df = df.fillna(0)
     
-    # Separate apps with and without input data
-    df_with_data = df[df['io_total_input_gb'] > 0].sort_values('io_total_input_gb', ascending=False).head(limit)
-    df_no_data = df[df['io_total_input_gb'] == 0].head(limit)
+    # Separate apps with and without meaningful work
+    has_data = (df['io_total_input_gb'] > 0) | (df['io_total_shuffle_read_gb'] > 0) | (df['io_total_shuffle_write_gb'] > 0)
+    df_with_data = df[has_data].sort_values('io_total_input_gb', ascending=False).head(limit)
+    df_no_data = df[~has_data].head(limit)
     
     log.info("Processing %d applications with data, %d with no input data", len(df_with_data), len(df_no_data))
     
@@ -259,9 +286,12 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         idle_pct = float(row.get('idle_core_percentage', 50.0) or 50.0)
         spill_gb = float(row.get('total_memory_spilled_gb', 0.0) or 0.0)
         disk_spill_gb = float(row.get('total_disk_spilled_gb', 0.0) or 0.0)
+        tot_executors = int(row.get('total_executors', 0) or 0)
+        act_executors = int(row.get('active_executors', 0) or 0)
+        orig_cores = int(row.get('orig_cores_per_executor', 0) or 0)
         
         sh_ratio = _calculate_shuffle_ratio(i_in_gb, s_in_gb, s_out_gb)
-        worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio)
+        worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio, max(s_in_gb, s_out_gb))
         
         shuffle_data_gb = max(s_in_gb, s_out_gb)
         shuffle_bytes = shuffle_data_gb * 1024 * 1024 * 1024
@@ -270,7 +300,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         def auto_tune_custom(shuffle_bytes, max_executors):
             target_mib = target_partition_size_mib
             if shuffle_bytes > 0:
-                partitions = int((shuffle_bytes / (target_mib * 1024 * 1024)) + 0.5)
+                partitions = max(2 * max_executors, int((shuffle_bytes / (target_mib * 1024 * 1024)) + 0.5))
             else:
                 # Scale by input size (128MB per partition) instead of flat 200
                 partitions = max(2, min(200, int(i_in_gb / 0.128)))
@@ -280,21 +310,25 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         
         # Cost-optimized
         max_exec_cost_init, min_exec_cost = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost"
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
+            active_executors=act_executors, orig_cores_per_executor=orig_cores
         )
         sp_cost, target_mib_cost = auto_tune_custom(shuffle_bytes, max_exec_cost_init)
         max_exec_cost, min_exec_cost = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost"
+            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
+            active_executors=act_executors, orig_cores_per_executor=orig_cores
         )
         executor_disk_cost = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_cost)
         
         # Performance-optimized
         max_exec_perf_init, min_exec_perf = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance"
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance",
+            active_executors=act_executors, orig_cores_per_executor=orig_cores
         )
         sp_perf, target_mib_perf = auto_tune_custom(shuffle_bytes, max_exec_perf_init)
         max_exec_perf, min_exec_perf = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance"
+            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance",
+            active_executors=act_executors, orig_cores_per_executor=orig_cores
         )
         executor_disk_perf = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_perf)
         
@@ -335,6 +369,12 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             cfg.update(_get_iceberg_configs())
             if sh_ratio > 30:
                 cfg.update({"spark.shuffle.compress": "true", "spark.shuffle.spill.compress": "true"})
+            if max_exec <= 2:
+                cfg["spark.dynamicAllocation.enabled"] = "false"
+                cfg["spark.executor.instances"] = str(max_exec)
+                del cfg["spark.dynamicAllocation.maxExecutors"]
+                del cfg["spark.dynamicAllocation.minExecutors"]
+                del cfg["spark.dynamicAllocation.initialExecutors"]
             return cfg
         
         # Cost recommendation

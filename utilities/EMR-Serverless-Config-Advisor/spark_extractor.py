@@ -978,6 +978,7 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit,
                 "sql_metrics": sql_metrics,
                 "executor_timeline": executor_timeline,
                 "sql_executions": sql_executions,
+                "spark_config": spark_config,
             }
 
             config_output = {

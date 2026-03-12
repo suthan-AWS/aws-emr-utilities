@@ -4162,6 +4162,7 @@ def process_application(args_tuple: Tuple[str, List[str], str]) -> Tuple[str, Di
         "sql_metrics": sql_metrics,
         "executor_timeline": executor_timeline,
         "sql_executions": sql_metrics.get("sql_executions", []),
+        "spark_config": spark_config,
     }
     
     config_output = {
