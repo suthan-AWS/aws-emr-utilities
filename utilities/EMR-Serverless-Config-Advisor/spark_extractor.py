@@ -354,6 +354,33 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit,
                 except Exception:
                     pass
 
+            # ── Early exit for empty apps (no tasks/executors/jobs) ──
+            df_fields = [f.name for f in df.schema.fields]
+            if "Task Metrics" not in df_fields and "Executor ID" not in df_fields:
+                print(f"  ⚠ {app_id}: No task/executor data — emitting minimal output")
+                _start_iso = datetime.fromtimestamp(start_ts / 1000).isoformat() if start_ts else None
+                _end_iso = datetime.fromtimestamp(end_ts / 1000).isoformat() if end_ts else None
+                _empty = {
+                    "application_id": app_id, "extraction_timestamp": datetime.now().isoformat(),
+                    "extraction_engine": "spark", "application_info": {"app_id": spark_app_id, "application_name": app_name, "job_id": job_id},
+                    "application_start_time": _start_iso, "application_end_time": _end_iso,
+                    "total_run_duration_minutes": duration_minutes, "total_run_duration_hours": duration_hours,
+                    "task_summary": {"total_tasks": 0, "completed_tasks": 0, "failed_tasks": 0, "killed_tasks": 0},
+                    "stage_summary": {"total_stages": 0, "stages": []},
+                    "executor_summary": {"total_executors": 0, "active_executors": 0, "avg_memory_utilization_percent": 0, "avg_cpu_utilization_percent": 0, "idle_core_percentage": 0},
+                    "io_summary": {"application_level": {"total_input_bytes": 0, "total_input_gb": 0, "total_output_bytes": 0, "total_output_gb": 0, "total_shuffle_read_bytes": 0, "total_shuffle_read_gb": 0, "total_shuffle_write_bytes": 0, "total_shuffle_write_gb": 0, "tasks_analyzed": 0}},
+                    "spill_summary": {"total_memory_spilled_bytes": 0, "total_memory_spilled_gb": 0, "total_disk_spilled_bytes": 0, "total_disk_spilled_gb": 0},
+                    "shuffle_data_summary": {"total_shuffle_read_gb": 0, "total_shuffle_write_gb": 0},
+                    "total_cost_factor": 0, "driver_metrics": None, "job_details": [], "sql_metrics": {},
+                    "executor_timeline": [], "sql_executions": [], "spark_config": spark_config,
+                }
+                _cfg = {"application_id": app_id, "application_name": app_name, "spark_configuration": spark_config,
+                        "application_start_time": _start_iso, "application_end_time": _end_iso,
+                        "total_run_duration_minutes": duration_minutes, "total_run_duration_hours": duration_hours, "total_cost_factor": 0}
+                results.append((app_id, _empty, _cfg))
+                df.unpersist()
+                continue
+
             # ── Task end reason breakdown ────────────────────────
             task_ends = df.filter(F.col("Event") == "SparkListenerTaskEnd")
 
