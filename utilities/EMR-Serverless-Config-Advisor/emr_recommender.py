@@ -98,48 +98,68 @@ def _calculate_shuffle_ratio(input_gb, read_gb, write_gb) -> float:
     return round((read_gb + write_gb) / input_gb * 100.0, 2)
 
 
-def _select_worker_type(input_gb: float, shuffle_ratio: float) -> Tuple[str, Dict]:
-    WORKERS = {
-        "Small": {"vcpu": 4, "memory": 27},
-        "Medium": {"vcpu": 8, "memory": 54},
-        "Large": {"vcpu": 16, "memory": 108},
+def _select_worker_type(input_gb: float, shuffle_ratio: float,
+                        mem_pct: float = 60.0, spill_gb: float = 0.0,
+                        cpu_pct: float = 50.0, orig_mem_mb: int = 0,
+                        max_peak_mem_gb: float = 0, orig_cores: int = 0) -> Tuple[str, Dict]:
+    # EMR Serverless memory ranges per vCPU size
+    WORKER_RANGES = {
+        "Small":  {"vcpu": 4,  "min_mem": 8,  "max_mem": 30, "mem_step": 1},
+        "Medium": {"vcpu": 8,  "min_mem": 16, "max_mem": 60, "mem_step": 4},
+        "Large":  {"vcpu": 16, "min_mem": 32, "max_mem": 120, "mem_step": 8},
     }
-    
-    if input_gb > 2048 or shuffle_ratio > 70:
-        return "Large", WORKERS["Large"]
-    elif input_gb > 500 or shuffle_ratio > 40:
-        return "Medium", WORKERS["Medium"]
+
+    # Select worker size based on data volume and spill (workload properties)
+    if input_gb > 2048 or (spill_gb > 100):
+        size = "Large"
+    elif input_gb > 500 or (spill_gb > 10) or shuffle_ratio > 50:
+        size = "Large"
     else:
-        return "Small", WORKERS["Small"]
+        size = "Small"
+
+    r = WORKER_RANGES[size]
+
+    # Memory sizing: peak memory per core + 50% headroom
+    if max_peak_mem_gb > 0 and orig_cores > 0:
+        peak_per_core = max_peak_mem_gb / orig_cores
+        mem_needed = int(peak_per_core * 1.5 * r["vcpu"])
+        mem = max(r["min_mem"], min(r["max_mem"], mem_needed))
+    elif spill_gb > 0:
+        mem = r["max_mem"]
+    else:
+        mem = r["min_mem"]
+
+    # Round down to valid EMR Serverless memory increment (headroom already included)
+    step = r["mem_step"]
+    mem = min(r["max_mem"], max(r["min_mem"], r["min_mem"] + ((mem - r["min_mem"]) // step) * step))
+
+    return size, {"vcpu": r["vcpu"], "memory": mem}
 
 
 def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
                         mem_pct: float = 60.0, cpu_pct: float = 50.0,
                         idle_pct: float = 50.0, spill_gb: float = 0.0,
-                        mode: str = "cost") -> Tuple[int, int]:
+                        mode: str = "cost", max_stage_tasks: int = 0) -> Tuple[int, int]:
     req_input = max(1, int(input_gb / 100))
-    req_part = max(1, int((partitions / vcpu) / 3)) if partitions > 0 else 0
+    part_divisor = 4 if mode == "cost" else 3
+    req_part = max(1, int((partitions / vcpu) / part_divisor)) if partitions > 0 else 0
     base_req = max(req_input, req_part)
     
+    # Pressure factor based on spill (stable workload property)
+    spill_ratio = (spill_gb / max(input_gb, 1)) * 100
+    spill_pressure = min(40, spill_ratio * 0.2)
     if mode == "performance":
-        if mem_pct > 75:
-            factor = 1.0 + ((mem_pct - 75) / 25) * 0.5
-        else:
-            mem_pressure = mem_pct * 0.4
-            cpu_pressure = cpu_pct * 0.4
-            spill_ratio = (spill_gb / max(input_gb, 1)) * 100
-            spill_pressure = min(20, spill_ratio * 0.2)
-            pressure = max(0, min(100, mem_pressure + cpu_pressure + spill_pressure))
-            factor = 0.5 + (pressure / 100) * 1.0
+        factor = 1.0 + (spill_pressure / 100) * 0.5
     else:
-        mem_pressure = mem_pct * 0.4
-        cpu_pressure = cpu_pct * 0.4
-        spill_ratio = (spill_gb / max(input_gb, 1)) * 100
-        spill_pressure = min(20, spill_ratio * 0.2)
-        pressure = max(0, min(100, mem_pressure + cpu_pressure + spill_pressure))
-        factor = 0.5 + (pressure / 100) * 1.0
+        factor = 0.8 + (spill_pressure / 100) * 0.5
     
     max_exec = max(2, int(base_req * factor))
+
+    # Task parallelism floor — performance mode only
+    if mode == "performance" and max_stage_tasks > 0 and spill_gb == 0:
+        task_floor = max(2, int(max_stage_tasks / vcpu / 3))
+        max_exec = max(max_exec, task_floor)
+
     min_exec = max(1, max_exec // 2)
     
     return max_exec, min_exec
@@ -227,6 +247,10 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'idle_core_percentage': util_data.get('idle_core_percentage'),
             'total_memory_spilled_gb': spill_data.get('total_memory_spilled_gb'),
             'total_disk_spilled_gb': spill_data.get('total_disk_spilled_gb'),
+            'max_stage_tasks': max((s.get('num_tasks', 0) for s in data.get('stage_summary', {}).get('stages', [])), default=0),
+            'max_peak_memory_gb': util_data.get('max_peak_memory_gb', 0),
+            'orig_executor_cores': int(data.get('spark_config', {}).get('spark.executor.cores', 0) or 0),
+            'max_stage_shuffle_write_gb': data.get('shuffle_data_summary', {}).get('max_stage_shuffle_write_gb', 0),
         }
         flattened.append(flat)
     
@@ -260,9 +284,14 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         idle_pct = float(row.get('idle_core_percentage', 50.0) or 50.0)
         spill_gb = float(row.get('total_memory_spilled_gb', 0.0) or 0.0)
         disk_spill_gb = float(row.get('total_disk_spilled_gb', 0.0) or 0.0)
+        max_stage_tasks = int(row.get('max_stage_tasks', 0) or 0)
+        max_peak_mem_gb = float(row.get('max_peak_memory_gb', 0) or 0)
+        orig_cores = int(row.get('orig_executor_cores', 0) or 0)
+        max_stage_shuf_write = float(row.get('max_stage_shuffle_write_gb', 0) or 0)
         
         sh_ratio = _calculate_shuffle_ratio(i_in_gb, s_in_gb, s_out_gb)
-        worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio)
+        worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio, mem_pct, spill_gb, cpu_pct,
+                                                      max_peak_mem_gb=max_peak_mem_gb, orig_cores=orig_cores)
         
         shuffle_data_gb = max(s_in_gb, s_out_gb)
         shuffle_bytes = shuffle_data_gb * 1024 * 1024 * 1024
@@ -281,21 +310,21 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         
         # Cost-optimized
         max_exec_cost_init, min_exec_cost = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost"
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost", max_stage_tasks=max_stage_tasks
         )
         sp_cost, target_mib_cost = auto_tune_custom(shuffle_bytes, max_exec_cost_init)
         max_exec_cost, min_exec_cost = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost"
+            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost", max_stage_tasks=max_stage_tasks
         )
         executor_disk_cost = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_cost)
         
         # Performance-optimized
         max_exec_perf_init, min_exec_perf = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance"
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance", max_stage_tasks=max_stage_tasks
         )
         sp_perf, target_mib_perf = auto_tune_custom(shuffle_bytes, max_exec_perf_init)
         max_exec_perf, min_exec_perf = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance"
+            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance", max_stage_tasks=max_stage_tasks
         )
         executor_disk_perf = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_perf)
         
@@ -317,8 +346,8 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         # Build Spark configs
         def build_spark_cfg(max_exec, min_exec, sp, executor_disk):
             cfg = {
-                "spark.driver.cores": "8",
-                "spark.driver.memory": "54G",
+                "spark.driver.cores": str(min(4, worker_cfg["vcpu"])),
+                "spark.driver.memory": f"{min(14, worker_cfg['memory'])}G",
                 "spark.executor.cores": str(worker_cfg["vcpu"]),
                 "spark.executor.memory": f"{worker_cfg['memory']}g",
                 "spark.dynamicAllocation.enabled": "true",
@@ -336,6 +365,11 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             cfg.update(_get_iceberg_configs())
             if sh_ratio > 30:
                 cfg.update({"spark.shuffle.compress": "true", "spark.shuffle.spill.compress": "true"})
+            # Serverless storage: if max stage shuffle write <= 75% of 200GB limit
+            if max_stage_shuf_write <= 150:
+                cfg["spark.aws.serverlessStorage.enabled"] = "true"
+                cfg.pop("spark.emr-serverless.executor.disk", None)
+                cfg.pop("spark.emr-serverless.executor.disk.type", None)
             return cfg
         
         # Cost recommendation
