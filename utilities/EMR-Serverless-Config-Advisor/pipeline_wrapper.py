@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--performance-optimized", action="store_true", help="Generate only performance-optimized recommendations")
     parser.add_argument("--individual-files", action="store_true", help="Generate individual JSON files per job")
     parser.add_argument("--write-to-iceberg-table", help="Write recommendations to Iceberg table (catalog.database.table)")
+    parser.add_argument("--serverless-storage", action="store_true", help="Enable serverless storage recommendations (disabled by default)")
     parser.add_argument("--skip-extraction", action="store_true", help="Skip extraction step (use existing data)")
 
     args = parser.parse_args()
@@ -114,6 +115,8 @@ def main():
         cmd.append("--individual-files")
     if args.write_to_iceberg_table:
         cmd.extend(["--write-to-iceberg-table", args.write_to_iceberg_table])
+    if args.serverless_storage:
+        cmd.append("--serverless-storage")
 
     if not run_command(cmd, "Stage 2: Generate recommendations"):
         sys.exit(1)

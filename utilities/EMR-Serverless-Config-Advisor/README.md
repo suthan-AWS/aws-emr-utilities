@@ -290,6 +290,9 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--format-job-config` | Deployment-ready format | standard |
 | `--target-partition-size` | Shuffle partition size in MiB | 1024 |
 | `--limit` | Max applications | 100 |
+| `--serverless-storage` | Enable serverless storage recommendations | off |
+
+**Serverless storage** is disabled by default. When disabled, recommendations include attached executor disk (`spark.emr-serverless.executor.disk`). Pass `--serverless-storage` to enable it — serverless storage will only be recommended when the workload has zero disk spill and shuffle volume is within safe limits. This is because EMR Serverless local disk is fixed at 20GB and cannot be increased; any disk spill (shuffle sort spill, memory spill overflow) goes to local disk, not serverless storage, and can cause "No space left on device" failures.
 
 ### format_to_job_config.py
 
