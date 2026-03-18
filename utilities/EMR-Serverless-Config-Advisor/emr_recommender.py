@@ -229,7 +229,8 @@ def _get_iceberg_configs() -> Dict[str, str]:
 
 
 def generate_dual_recommendations(input_path: str, limit: int = 100,
-                                  target_partition_size_mib: int = 1024) -> Tuple[List[Dict], List[Dict]]:
+                                  target_partition_size_mib: int = 1024,
+                                  serverless_storage: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """Generate both cost and performance recommendations."""
     
     # Load metrics
@@ -355,10 +356,22 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         }
         
         # Build Spark configs
+        def _driver_sizing(partitions, max_exec, shuffle_gb):
+            """Scale driver based on coordination overhead."""
+            if partitions > 10000 or max_exec > 500 or shuffle_gb > 10000:
+                return 16, 108
+            elif partitions > 2000 or max_exec > 100 or shuffle_gb > 2000:
+                return 8, 54
+            elif partitions > 500 or max_exec > 50 or shuffle_gb > 500:
+                return 4, 28
+            else:
+                return 4, 14
+
         def build_spark_cfg(max_exec, min_exec, sp, executor_disk):
+            d_cores, d_mem = _driver_sizing(sp, max_exec, s_in_gb + s_out_gb)
             cfg = {
-                "spark.driver.cores": str(min(4, worker_cfg["vcpu"])),
-                "spark.driver.memory": f"{min(14, worker_cfg['memory'])}G",
+                "spark.driver.cores": str(d_cores),
+                "spark.driver.memory": f"{d_mem}G",
                 "spark.executor.cores": str(worker_cfg["vcpu"]),
                 "spark.executor.memory": f"{worker_cfg['memory']}g",
                 "spark.dynamicAllocation.enabled": "true",
@@ -376,15 +389,13 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             cfg.update(_get_iceberg_configs())
             if sh_ratio > 30:
                 cfg.update({"spark.shuffle.compress": "true", "spark.shuffle.spill.compress": "true"})
-            # Serverless storage: shuffle fits in 200GB limit
-            # If recommended memory > peak memory with headroom, spill likely eliminated
-            spill_likely_gone = (max_peak_mem_gb > 0 and worker_cfg["memory"] >= max_peak_mem_gb * 1.3)
-            effective_spill = 0 if spill_likely_gone else (disk_spill_gb + spill_gb)
-            disk_spill_per_exec = effective_spill / max(max_exec, 1)
-            if max_stage_shuf_write <= 150 and disk_spill_per_exec <= 15:
-                cfg["spark.aws.serverlessStorage.enabled"] = "true"
-                cfg.pop("spark.emr-serverless.executor.disk", None)
-                cfg.pop("spark.emr-serverless.executor.disk.type", None)
+            # Serverless storage: only when explicitly enabled and disk pressure is safe
+            if serverless_storage:
+                disk_spill_per_exec = (disk_spill_gb + spill_gb) / max(max_exec, 1)
+                if disk_spill_gb == 0 and max_stage_shuf_write <= 150 and disk_spill_per_exec <= 15:
+                    cfg["spark.aws.serverlessStorage.enabled"] = "true"
+                    cfg.pop("spark.emr-serverless.executor.disk", None)
+                    cfg.pop("spark.emr-serverless.executor.disk.type", None)
             return cfg
         
         # Cost recommendation
@@ -514,6 +525,8 @@ if __name__ == "__main__":
                         help="Generate only performance-optimized recommendations")
     parser.add_argument("--individual-files", action="store_true",
                         help="Generate individual JSON files per job (1-jobname.json, 2-jobname.json, ...)")
+    parser.add_argument("--serverless-storage", action="store_true",
+                        help="Enable serverless storage recommendations (disabled by default)")
     parser.add_argument("--write-to-iceberg-table",
                         help="Write recommendations to Iceberg table (catalog.database.table)")
     
@@ -523,7 +536,8 @@ if __name__ == "__main__":
     cost_recs, perf_recs = generate_dual_recommendations(
         args.input_path,
         args.limit,
-        args.target_partition_size
+        args.target_partition_size,
+        serverless_storage=args.serverless_storage
     )
     
     # Determine which recommendations to generate
