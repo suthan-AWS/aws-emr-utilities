@@ -358,8 +358,8 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         # Build Spark configs
         def _driver_sizing(partitions, max_exec, shuffle_gb):
             """Scale driver based on coordination overhead."""
-            if partitions > 10000 or max_exec > 200 or shuffle_gb > 10000:
-                return 16, 100
+            if partitions > 10000 or max_exec > 500 or shuffle_gb > 10000:
+                return 16, 108
             elif partitions > 2000 or max_exec > 100 or shuffle_gb > 2000:
                 return 8, 54
             elif partitions > 500 or max_exec > 50 or shuffle_gb > 500:
