@@ -106,7 +106,7 @@ def _select_worker_type(input_gb: float, shuffle_ratio: float,
     WORKER_RANGES = {
         "Small":  {"vcpu": 4,  "min_mem": 8,  "max_mem": 27, "mem_step": 1},
         "Medium": {"vcpu": 8,  "min_mem": 16, "max_mem": 54, "mem_step": 4},
-        "Large":  {"vcpu": 16, "min_mem": 32, "max_mem": 108, "mem_step": 8},
+        "Large":  {"vcpu": 16, "min_mem": 64, "max_mem": 108, "mem_step": 8},
     }
 
     # Select worker size based on data volume and spill (workload properties)
