@@ -1,6 +1,31 @@
 # EMR Serverless Config Advisor
 
-Analyzes Spark event logs from EMR on EC2 or EMR Serverless and generates optimized configurations with cost and performance recommendations.
+Analyzes Spark event logs from EMR on EC2 or EMR Serverless and generates optimized EMR Serverless configurations. Produces cost-optimized and performance-optimized recommendations based on actual workload properties — input size, shuffle volume, memory utilization, disk spill, and shuffle I/O patterns.
+
+## How It Works
+
+The advisor extracts 80+ metrics from Spark event logs and uses them to calculate right-sized EMR Serverless configurations:
+
+1. **Extract** — Parse Spark event logs (compressed `.zst` or plain JSON) to produce per-application metrics: task counts, stage-level shuffle/spill, executor memory and CPU utilization, I/O timing breakdowns, and driver statistics.
+
+2. **Recommend** — Analyze extracted metrics to determine optimal worker size (Small/Medium/Large), executor count, shuffle partitions, disk configuration, and timeout settings. Two modes:
+   - **Cost-optimized**: Minimum resources to complete the job reliably
+   - **Performance-optimized**: Additional headroom for SLA-critical workloads
+
+3. **Format** — Convert recommendations into deployment-ready EMR Serverless `sparkSubmitParameters` JSON.
+
+### Key Sizing Decisions
+
+| Decision | Based On |
+|----------|----------|
+| Worker type (Small 4c / Medium 8c / Large 16c) | Peak memory per executor, memory utilization |
+| Executor memory | 1.5× observed peak memory, rounded to valid EMR Serverless increments |
+| Max executors | Shuffle volume ÷ target partition size (1 GB default) ÷ cores per worker |
+| Shuffle partitions | Total shuffle data ÷ 1 GB target partition size |
+| Driver sizing | Partition count, executor count, and shuffle volume thresholds |
+| Disk configuration | 500G shuffle-optimized attached disk (default) |
+| Timeout tuning | Input size + duration-based network and shuffle timeouts |
+| IO-aware scaling | For shuffle-bound jobs (>50% fetch wait), automatically switches to smaller workers with more disks to increase aggregate disk throughput |
 
 ## Architecture
 
@@ -43,29 +68,74 @@ Analyzes Spark event logs from EMR on EC2 or EMR Serverless and generates optimi
 └──────────────┘         └──────────────────────────────────────────────────────┘
 ```
 
-**Flow:**
-1. Lambda orchestrator lists event log apps in S3, submits one EMR Serverless job per app (parallel)
-2. Each `spark_extractor.py` job reads compressed event logs, extracts 80+ metrics per app
-3. `emr_recommender.py` reads extracted metrics, generates cost/performance Spark configs
-4. `write_to_iceberg.py` (optional) writes metrics + recommendations to an Iceberg table via Spark
-
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `spark_extractor.py` | Extracts metrics from Spark event logs using PySpark |
-| `python_extractor.py` | Extracts metrics from Spark event logs using pure Python (no Spark required) |
+| `spark_extractor.py` | Extracts metrics from Spark event logs using PySpark (runs on EMR) |
+| `python_extractor.py` | Extracts metrics from Spark event logs using pure Python (runs anywhere) |
 | `pipeline_wrapper.py` | End-to-end orchestrator: extract → recommend → format (no Spark required) |
-| `lambda_orchestrator.py` | Lambda function that submits parallel EMR Serverless jobs |
-| `emr_recommender.py` | Generates cost/performance optimized Spark configurations |
-| `write_to_iceberg.py` | Writes metrics + recommendations to Iceberg table via Spark |
-| `format_to_job_config.py` | Formats recommendations into EMR Serverless job config format |
+| `emr_recommender.py` | Generates cost and performance optimized Spark configurations |
+| `format_to_job_config.py` | Converts recommendations into EMR Serverless `sparkSubmitParameters` format |
+| `lambda_orchestrator.py` | Lambda function that submits parallel EMR Serverless extraction jobs |
+| `write_to_iceberg.py` | Writes metrics and recommendations to an Iceberg table via Spark |
 
 ## Quick Start
 
-### Option 1: Lambda + EMR Serverless (recommended)
+### Option 1: Pure Python Pipeline (no Spark required)
 
-Deploy `lambda_orchestrator.py` as a Lambda function, then invoke:
+Run all three stages (extract → recommend → format) in one command on any machine with Python 3.7+:
+
+```bash
+python3 pipeline_wrapper.py \
+  --input s3://your-bucket/event-logs/ \
+  --output /tmp/advisor-output/ \
+  --format-job-config
+```
+
+This produces:
+- `task_stage_summary/*.json` — extracted metrics per application
+- `recommendations.json` — cost and performance recommendations
+- `job_config_*.json` — deployment-ready EMR Serverless configs
+
+To re-run recommendations on previously extracted data:
+
+```bash
+python3 pipeline_wrapper.py \
+  --input s3://your-bucket/event-logs/ \
+  --output /tmp/advisor-output/ \
+  --skip-extraction \
+  --format-job-config
+```
+
+### Option 2: Step-by-Step
+
+Extract metrics:
+
+```bash
+python3 python_extractor.py \
+  --input s3://your-bucket/event-logs/ \
+  --output /tmp/extracted/
+```
+
+Generate recommendations:
+
+```bash
+python3 emr_recommender.py \
+  --input-path /tmp/extracted/ \
+  --output-cost cost.json \
+  --output-perf perf.json
+```
+
+Format for deployment:
+
+```bash
+python3 format_to_job_config.py --input cost.json --output job_config.json
+```
+
+### Option 3: Lambda + EMR Serverless (at scale)
+
+For processing hundreds of applications, deploy `lambda_orchestrator.py` as a Lambda function:
 
 ```bash
 aws lambda invoke \
@@ -82,16 +152,7 @@ aws lambda invoke \
   output.json
 ```
 
-Then generate recommendations:
-
-```bash
-python3 emr_recommender.py \
-  --input-path s3://your-bucket/advisor-output/ \
-  --output-cost cost.json \
-  --output-perf perf.json
-```
-
-### Option 2: Direct spark-submit
+### Option 4: Direct spark-submit
 
 ```bash
 spark-submit --master local[*] --driver-memory 32g \
@@ -100,74 +161,52 @@ spark-submit --master local[*] --driver-memory 32g \
   --output /tmp/output/
 ```
 
-### Option 3: Pure Python (no Spark required)
-
-Run extraction on any machine with Python 3.7+ — no Spark or PySpark needed:
-
-```bash
-python3 python_extractor.py \
-  --input s3://your-bucket/event-logs/ \
-  --output /tmp/output/
-```
-
-For a single application:
-
-```bash
-python3 python_extractor.py \
-  --input s3://your-bucket/event-logs/app_123/ \
-  --output /tmp/output/ \
-  --single-app
-```
-
-Output format is identical to `spark_extractor.py` and works with `emr_recommender.py`.
-
-### Option 4: End-to-End Pipeline (no Spark required)
-
-Run all three stages (extract → recommend → format) in one command:
-
-```bash
-python3 pipeline_wrapper.py \
-  --input s3://your-bucket/event-logs/ \
-  --output s3://your-bucket/extracted/ \
-  --format-job-config
-```
-
-Skip extraction to re-run recommendations on existing data:
-
-```bash
-python3 pipeline_wrapper.py \
-  --input s3://your-bucket/event-logs/ \
-  --output s3://your-bucket/extracted/ \
-  --skip-extraction \
-  --format-job-config
-```
-
-## Extracted Metrics
-
-Each app produces a JSON with these sections:
-
-| Section | Key Fields |
-|---------|------------|
-| `task_summary` | total/completed/failed/killed tasks, success rate |
-| `stage_summary` | per-stage shuffle read/write, spill, duration, failure reasons |
-| `executor_summary` | 20 fields per executor: cores, memory, uptime, utilization, cost factor |
-| `io_summary` | total input/output/shuffle read/write in GB |
-| `spill_summary` | memory + disk spill totals and percentages |
-| `shuffle_data_summary` | peak stage shuffle write, EMR Serverless storage eligibility (200GB limit) |
-| `driver_metrics` | GC stats, off-heap memory, tasks/jobs/stages launched |
-| `job_details` | per-job duration, status, stage mapping |
-| `sql_metrics` | per-SQL execution plan, duration, status |
-
 ## Recommendation Modes
 
 | Mode | Strategy | Best For |
 |------|----------|----------|
-| Cost | Conservative scaling (0.5–1.5× base); for IO-bound jobs (>50% shuffle fetch wait), automatically uses smaller workers with more disks | Dev/test, budget workloads |
-| Performance | Aggressive scaling for memory-stressed jobs; for IO-bound jobs, uses smaller workers scaled to perf executor count | Production SLA-critical |
+| Cost | Minimum resources to complete reliably. For shuffle-bound jobs (>50% fetch wait), automatically uses smaller workers with more disks to increase I/O throughput without over-provisioning compute. | Dev/test, batch workloads, cost-sensitive production |
+| Performance | Additional executor headroom (1.5–2× cost). For shuffle-bound jobs, scales the IO-aware worker configuration to the higher executor count. | SLA-critical production, latency-sensitive jobs |
+
+### IO-Aware Scaling
+
+When a job spends more than 50% of its time waiting on shuffle fetches, the standard Large-worker configuration won't help — the bottleneck is disk I/O, not compute. The advisor automatically detects this and:
+
+- Switches to smaller workers (Medium 8c or Small 4c) to increase the number of independent disks
+- Keeps the same total vCPU and per-task memory (e.g., Large 16c/108G → Small 4c/27G = same 6.75 GB/task)
+- Limits the multiplier based on fleet size: jobs with >200 cost executors cap at 2× (Large→Medium) to avoid excessive shuffle network connections; smaller jobs allow up to 4× (Large→Small)
+
+This is applied transparently to both cost and performance outputs — no separate flag needed.
+
+## Extracted Metrics
+
+Each application produces a JSON with these sections:
+
+| Section | Key Fields |
+|---------|------------|
+| `task_summary` | Total/completed/failed/killed tasks, success rate |
+| `stage_summary` | Per-stage shuffle read/write, spill, duration, failure reasons |
+| `executor_summary` | Per-executor cores, memory, uptime, utilization, peak memory, cost factor |
+| `io_summary` | Total input/output/shuffle bytes, shuffle fetch wait %, GC %, write time % |
+| `spill_summary` | Memory and disk spill totals and percentages |
+| `shuffle_data_summary` | Peak stage shuffle write, EMR Serverless storage eligibility |
+| `driver_metrics` | GC stats, off-heap memory, tasks/jobs/stages launched |
+| `job_details` | Per-job duration, status, stage mapping |
+| `sql_metrics` | Per-SQL execution plan, duration, status |
+
+## Serverless Storage
+
+Serverless storage is **disabled by default**. Recommendations use attached executor disk (`spark.emr-serverless.executor.disk: 500G`).
+
+Pass `--serverless-storage` to enable it. Serverless storage will only be recommended when:
+- The workload has **zero disk spill**
+- Shuffle volume per stage is within safe limits
+
+This is because EMR Serverless local disk is fixed at 20GB and cannot be increased. Shuffle sort spill and memory spill overflow go to local disk, not serverless storage. Enabling serverless storage for spill-heavy jobs causes "No space left on device" failures.
 
 ## Write to Iceberg Table
 
-### Option A: Let the script create the table
+Optionally persist recommendations to an Iceberg table for tracking over time:
 
 ```bash
 spark-submit \
@@ -179,9 +218,7 @@ spark-submit \
   --warehouse s3://your-bucket/iceberg/
 ```
 
-### Option B: Create the table yourself first
-
-Use this DDL in Athena (V3 engine) or Spark SQL:
+The table can also be created manually via Athena (V3 engine) or Spark SQL:
 
 ```sql
 CREATE TABLE IF NOT EXISTS your_database.config_advisor (
@@ -210,18 +247,16 @@ USING iceberg
 LOCATION 's3://your-bucket/iceberg/your_database/config_advisor/'
 ```
 
-Then run `write_to_iceberg.py` — it will detect the existing table and append data.
-
-### Query Examples
+### Example Queries
 
 ```sql
 -- Latest recommendations
-SELECT job_id, application_name, input_gb, duration_hours,
-       peak_shuffle_write_per_stage, cost_factor
+SELECT job_id, application_name, optimization_mode, input_gb,
+       duration_hours, cost_factor
 FROM your_database.config_advisor
 ORDER BY created_at DESC;
 
--- Jobs exceeding Serverless storage limit (200GB)
+-- Jobs exceeding Serverless storage limit
 SELECT job_id, application_name, peak_shuffle_write_per_stage
 FROM your_database.config_advisor
 WHERE peak_shuffle_write_per_stage > 200;
@@ -236,16 +271,6 @@ ORDER BY total_memory_spilled_gb DESC;
 
 ## CLI Reference
 
-### spark_extractor.py
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--input` | S3 path or local path to event logs | *required* |
-| `--output` | Output path for extracted metrics | *required* |
-| `--limit` | Max applications to process | 100 |
-| `--single-app` | Input path is a single app (not a directory of apps) | false |
-| `--decompress-workers` | Parallel S3 download threads | 50 |
-
 ### python_extractor.py
 
 | Flag | Description | Default |
@@ -257,12 +282,27 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--workers` | Parallel processing workers | 20 |
 | `--profile` | AWS profile name for S3 access | default |
 
+### emr_recommender.py
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input-path` | Path with extracted metrics (local or S3) | *required* |
+| `--output-cost` | Output file for cost-optimized recommendations | `recommendations_cost_optimized.json` |
+| `--output-perf` | Output file for performance-optimized recommendations | `recommendations_performance_optimized.json` |
+| `--cost-optimized` | Generate only cost recommendations | both |
+| `--performance-optimized` | Generate only performance recommendations | both |
+| `--individual-files` | One JSON file per application | single file |
+| `--format-job-config` | Output in deployment-ready format | standard |
+| `--target-partition-size` | Target shuffle partition size in MiB | 1024 |
+| `--limit` | Max applications to process | 100 |
+| `--serverless-storage` | Enable serverless storage recommendations | off |
+
 ### pipeline_wrapper.py
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--input` | S3 or local path to event logs | *required* |
-| `--output` | Output path for extracted metrics (S3 or local) | *required* |
+| `--output` | Output path for extracted metrics | *required* |
 | `--limit` | Max applications to process | 100 |
 | `--workers` | Parallel workers for extraction | 20 |
 | `--profile` | AWS profile name | default |
@@ -270,29 +310,13 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--region` | AWS region | us-east-1 |
 | `--target-partition-size` | Target shuffle partition size in MiB | 1024 |
 | `--results` | Output filename for recommendations | recommendations.json |
-| `--format-job-config` | Also format output to EMR Serverless job config JSON | false |
+| `--format-job-config` | Also produce EMR Serverless job config JSON | false |
 | `--cost-optimized` | Generate only cost-optimized recommendations | both |
 | `--performance-optimized` | Generate only performance-optimized recommendations | both |
-| `--individual-files` | Generate individual JSON files per job | single file |
-| `--write-to-iceberg-table` | Write recommendations to Iceberg table (`catalog.database.table`) | — |
-| `--skip-extraction` | Skip extraction step, use existing data in `--output` | false |
-
-### emr_recommender.py
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--input-path` | Path with extracted metrics (local or S3) | *required* |
-| `--output-cost` | Output file for cost-optimized recs | — |
-| `--output-perf` | Output file for performance-optimized recs | — |
-| `--cost-optimized` | Generate only cost recommendations | both |
-| `--performance-optimized` | Generate only performance recommendations | both |
-| `--individual-files` | One JSON per job | single file |
-| `--format-job-config` | Deployment-ready format | standard |
-| `--target-partition-size` | Shuffle partition size in MiB | 1024 |
-| `--limit` | Max applications | 100 |
+| `--individual-files` | Generate individual JSON files per application | single file |
+| `--write-to-iceberg-table` | Write to Iceberg table (`catalog.database.table`) | — |
+| `--skip-extraction` | Skip extraction, use existing data in `--output` | false |
 | `--serverless-storage` | Enable serverless storage recommendations | off |
-
-**Serverless storage** is disabled by default. When disabled, recommendations include attached executor disk (`spark.emr-serverless.executor.disk`). Pass `--serverless-storage` to enable it — serverless storage will only be recommended when the workload has zero disk spill and shuffle volume is within safe limits. This is because EMR Serverless local disk is fixed at 20GB and cannot be increased; any disk spill (shuffle sort spill, memory spill overflow) goes to local disk, not serverless storage, and can cause "No space left on device" failures.
 
 ### format_to_job_config.py
 
@@ -301,6 +325,16 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--input` | Input recommendations JSON file | *required* |
 | `--output` | Output job config JSON file | *required* |
 
+### spark_extractor.py
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input` | S3 path or local path to event logs | *required* |
+| `--output` | Output path for extracted metrics | *required* |
+| `--limit` | Max applications to process | 100 |
+| `--single-app` | Input path is a single app | false |
+| `--decompress-workers` | Parallel S3 download threads | 50 |
+
 ### write_to_iceberg.py
 
 | Flag | Description | Default |
@@ -308,17 +342,18 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--rec-path` | Path to recommendation JSON | *required* |
 | `--extract-path` | Path containing `task_stage_summary/` | *required* |
 | `--table` | Iceberg table: `catalog.database.table` | *required* |
-| `--warehouse` | S3 warehouse location | `s3://suthan-event-logs/iceberg/` |
+| `--warehouse` | S3 warehouse location | — |
 
 ## Prerequisites
 
-- Python 3.7+, `pip install boto3 zstandard pandas`
-- For Spark extraction: EMR cluster or EMR Serverless application
-- For Iceberg: Glue Catalog access, Iceberg Spark runtime JAR
+- Python 3.7+
+- `pip install boto3 zstandard pandas`
+- For Spark-based extraction: EMR cluster or EMR Serverless application
+- For Iceberg writes: Glue Catalog access, Iceberg Spark runtime JAR
 
 ## Legacy Scripts
 
-Previous Python-based extraction scripts are in the `legacy/` folder. Both `spark_extractor.py` (PySpark) and `python_extractor.py` (pure Python) replace `legacy/spark_processor.py` with identical output format.
+Previous extraction scripts are in the `legacy/` folder. Both `spark_extractor.py` (PySpark) and `python_extractor.py` (pure Python) replace `legacy/spark_processor.py` with identical output format.
 
 ## License
 
