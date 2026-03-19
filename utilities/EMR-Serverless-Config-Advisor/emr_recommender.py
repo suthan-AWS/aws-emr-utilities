@@ -129,9 +129,9 @@ def _select_worker_type(input_gb: float, shuffle_ratio: float,
     else:
         mem = r["min_mem"]
 
-    # Round down to valid EMR Serverless memory increment (headroom already included)
+    # Round UP to valid EMR Serverless memory increment (preserve headroom)
     step = r["mem_step"]
-    mem = min(r["max_mem"], max(r["min_mem"], r["min_mem"] + ((mem - r["min_mem"]) // step) * step))
+    mem = min(r["max_mem"], max(r["min_mem"], r["min_mem"] + (-(-(mem - r["min_mem"]) // step)) * step))
     # If within one step of max, use max (e.g. 108GB for Large)
     if mem + step > r["max_mem"]:
         mem = r["max_mem"]
@@ -230,8 +230,8 @@ def _get_iceberg_configs() -> Dict[str, str]:
 
 def generate_dual_recommendations(input_path: str, limit: int = 100,
                                   target_partition_size_mib: int = 1024,
-                                  serverless_storage: bool = False) -> Tuple[List[Dict], List[Dict]]:
-    """Generate both cost and performance recommendations."""
+                                  serverless_storage: bool = False) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """Generate cost, performance, and IO-optimized recommendations."""
     
     # Load metrics
     all_data = load_json_files(input_path, limit)
@@ -262,6 +262,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'max_peak_memory_gb': util_data.get('max_peak_memory_gb', 0),
             'orig_executor_cores': int(data.get('spark_config', {}).get('spark.executor.cores', 0) or 0),
             'max_stage_shuffle_write_gb': data.get('shuffle_data_summary', {}).get('max_stage_shuffle_write_gb', 0),
+            'shuffle_fetch_wait_percent': io_data.get('shuffle_fetch_wait_percent', 0),
         }
         flattened.append(flat)
     
@@ -279,6 +280,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
     
     cost_recs = []
     perf_recs = []
+    io_recs = []
     
     # Process applications with input data
     for _, row in df_with_data.iterrows():
@@ -299,6 +301,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         max_peak_mem_gb = float(row.get('max_peak_memory_gb', 0) or 0)
         orig_cores = int(row.get('orig_executor_cores', 0) or 0)
         max_stage_shuf_write = float(row.get('max_stage_shuffle_write_gb', 0) or 0)
+        shuffle_fetch_wait_pct = float(row.get('shuffle_fetch_wait_percent', 0) or 0)
         
         sh_ratio = _calculate_shuffle_ratio(i_in_gb, s_in_gb, s_out_gb)
         worker_type, worker_cfg = _select_worker_type(i_in_gb, sh_ratio, mem_pct, spill_gb, cpu_pct,
@@ -454,6 +457,64 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         
         cost_recs.append(cost_rec)
         perf_recs.append(perf_rec)
+
+        # IO-optimized: only for shuffle I/O bound jobs (>50% time in fetch wait)
+        DOWNSIZE_MAP = {
+            # (current_type, multiplier) -> target_type
+            ("Large", 2): "Medium",
+            ("Large", 4): "Small",
+            ("Medium", 2): "Small",
+        }
+        WORKER_RANGES_IO = {
+            "Small":  {"vcpu": 4,  "min_mem": 8,  "max_mem": 27, "mem_step": 1},
+            "Medium": {"vcpu": 8,  "min_mem": 16, "max_mem": 54, "mem_step": 4},
+            "Large":  {"vcpu": 16, "min_mem": 64, "max_mem": 108, "mem_step": 8},
+        }
+        io_mult = 4 if shuffle_fetch_wait_pct > 80 else 2 if shuffle_fetch_wait_pct > 50 else 0
+        io_target = DOWNSIZE_MAP.get((worker_type, io_mult))
+        if io_mult and io_target:
+            io_type = io_target
+            io_r = WORKER_RANGES_IO[io_type]
+            # Keep same per-task memory: original_mem / original_vcpu * new_vcpu
+            per_task_mem = worker_cfg["memory"] / worker_cfg["vcpu"]
+            io_mem = int(per_task_mem * io_r["vcpu"])
+            io_mem = min(io_r["max_mem"], max(io_r["min_mem"],
+                         io_r["min_mem"] + (-(-(io_mem - io_r["min_mem"]) // io_r["mem_step"])) * io_r["mem_step"]))
+            io_max = max_exec_cost * io_mult
+            io_min = min_exec_cost * io_mult
+            io_disk = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, io_max)
+            io_cfg = {"vcpu": io_r["vcpu"], "memory": io_mem}
+            # Temporarily swap worker_cfg for build_spark_cfg
+            saved_cfg, saved_type = worker_cfg, worker_type
+            worker_cfg, worker_type = io_cfg, io_type
+            io_rec = {
+                "application_id": app_id,
+                "application_name": name,
+                "optimization_mode": "io_optimized",
+                "metrics": base_metrics,
+            }
+            if job_id:
+                io_rec["job_id"] = job_id
+            io_rec.update({
+                "worker": {
+                    "type": io_type,
+                    "vcpu": io_r["vcpu"],
+                    "memory_gb": io_mem,
+                    "max_executors": io_max,
+                    "min_executors": io_min,
+                    "total_vcpu_capacity": io_max * io_r["vcpu"],
+                    "total_memory_capacity": io_max * io_mem,
+                },
+                "spark_configs": build_spark_cfg(io_max, io_min, sp_cost, io_disk),
+                "shuffle_tuned": {
+                    "partitions": sp_cost,
+                    "target_partition_size_mib": target_mib_cost,
+                    "auto_tuned": True,
+                },
+            })
+            worker_cfg, worker_type = saved_cfg, saved_type
+            io_recs.append(io_rec)
+        # No IO rec for non-IO-bound jobs or already-Small workers
     
     # Process applications with no input data - recommend minimal config
     for _, row in df_no_data.iterrows():
@@ -500,10 +561,11 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         
         cost_recs.append(minimal_rec)
         perf_recs.append(minimal_rec)
+        io_recs.append(minimal_rec)
     
-    log.info("Generated %d cost-optimized and %d performance-optimized recommendations",
-             len(cost_recs), len(perf_recs))
-    return cost_recs, perf_recs
+    log.info("Generated %d cost, %d performance, %d io-optimized recommendations",
+             len(cost_recs), len(perf_recs), len(io_recs))
+    return cost_recs, perf_recs, io_recs
 
 
 if __name__ == "__main__":
@@ -517,6 +579,7 @@ if __name__ == "__main__":
                         help="Target shuffle partition size in MiB (default: 1024 = 1GB)")
     parser.add_argument("--output-cost", default="recommendations_cost_optimized.json", help="Cost output file")
     parser.add_argument("--output-perf", default="recommendations_performance_optimized.json", help="Performance output file")
+    parser.add_argument("--output-io", default="recommendations_io_optimized.json", help="IO-optimized output file")
     parser.add_argument("--format-job-config", action="store_true",
                         help="Format output to job configuration format")
     parser.add_argument("--cost-optimized", action="store_true",
@@ -533,7 +596,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Generate recommendations
-    cost_recs, perf_recs = generate_dual_recommendations(
+    cost_recs, perf_recs, io_recs = generate_dual_recommendations(
         args.input_path,
         args.limit,
         args.target_partition_size,
@@ -593,6 +656,10 @@ if __name__ == "__main__":
             Path(args.output_perf).write_text(json.dumps(perf_recs, indent=2))
             log.info("Performance-optimized recommendations written to %s", args.output_perf)
     
+    # Write IO-optimized recommendations
+    Path(args.output_io).write_text(json.dumps(io_recs, indent=2))
+    log.info("IO-optimized recommendations written to %s", args.output_io)
+
     # Write to Iceberg table if requested
     if args.write_to_iceberg_table:
         from write_to_iceberg import write_to_iceberg

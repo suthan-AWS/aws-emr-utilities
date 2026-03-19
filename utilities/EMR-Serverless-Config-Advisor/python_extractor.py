@@ -973,6 +973,10 @@ def extract_io_summary(events):
     total_output_bytes = 0
     total_shuffle_read_bytes = 0
     total_shuffle_write_bytes = 0
+    total_shuffle_fetch_wait_ms = 0
+    total_shuffle_write_time_ns = 0
+    total_gc_time_ms = 0
+    total_executor_run_time_ms = 0
     task_count = 0
     tasks_with_input = 0
     tasks_with_output = 0
@@ -986,6 +990,9 @@ def extract_io_summary(events):
 
             if not task_metrics:
                 continue
+
+            total_gc_time_ms += task_metrics.get("JVM GC Time", 0)
+            total_executor_run_time_ms += task_metrics.get("Executor Run Time", 0)
 
             # Input metrics
             input_metrics = task_metrics.get("Input Metrics")
@@ -1009,6 +1016,7 @@ def extract_io_summary(events):
                 remote_bytes = shuffle_read.get("Remote Bytes Read", 0)
                 local_bytes = shuffle_read.get("Local Bytes Read", 0)
                 total_read = remote_bytes + local_bytes
+                total_shuffle_fetch_wait_ms += shuffle_read.get("Fetch Wait Time", 0)
 
                 if total_read > 0:
                     total_shuffle_read_bytes += total_read
@@ -1018,10 +1026,12 @@ def extract_io_summary(events):
             shuffle_write = task_metrics.get("Shuffle Write Metrics")
             if shuffle_write:
                 bytes_written = shuffle_write.get("Shuffle Bytes Written", 0)
+                total_shuffle_write_time_ns += shuffle_write.get("Shuffle Write Time", 0)
                 if bytes_written > 0:
                     total_shuffle_write_bytes += bytes_written
                     tasks_with_shuffle_write += 1
 
+    total_run_sec = total_executor_run_time_ms / 1000 if total_executor_run_time_ms > 0 else 1
     return {
         "application_level": {
             "total_input_bytes": total_input_bytes,
@@ -1032,6 +1042,13 @@ def extract_io_summary(events):
             "total_shuffle_read_gb": round(total_shuffle_read_bytes / (1024 ** 3), 2),
             "total_shuffle_write_bytes": total_shuffle_write_bytes,
             "total_shuffle_write_gb": round(total_shuffle_write_bytes / (1024 ** 3), 2),
+            "total_shuffle_fetch_wait_sec": round(total_shuffle_fetch_wait_ms / 1000, 2),
+            "total_shuffle_write_time_sec": round(total_shuffle_write_time_ns / 1e9, 2),
+            "total_gc_time_sec": round(total_gc_time_ms / 1000, 2),
+            "total_executor_run_time_sec": round(total_run_sec, 2),
+            "shuffle_fetch_wait_percent": round(total_shuffle_fetch_wait_ms / (total_executor_run_time_ms or 1) * 100, 2),
+            "shuffle_write_time_percent": round(total_shuffle_write_time_ns / 1e6 / (total_executor_run_time_ms or 1) * 100, 2),
+            "gc_time_percent": round(total_gc_time_ms / (total_executor_run_time_ms or 1) * 100, 2),
             "tasks_analyzed": task_count,
             "tasks_with_input": tasks_with_input,
             "tasks_with_output": tasks_with_output,
