@@ -164,6 +164,7 @@ Each app produces a JSON with these sections:
 |------|----------|----------|
 | Cost | Conservative scaling (0.5–1.5× base) | Dev/test, budget workloads |
 | Performance | Aggressive scaling for memory-stressed jobs | Production SLA-critical |
+| IO-Optimized | Smaller workers, more disks for shuffle-bound jobs | Jobs with >50% shuffle fetch wait |
 
 ## Write to Iceberg Table
 
@@ -284,6 +285,7 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--input-path` | Path with extracted metrics (local or S3) | *required* |
 | `--output-cost` | Output file for cost-optimized recs | — |
 | `--output-perf` | Output file for performance-optimized recs | — |
+| `--output-io` | Output file for IO-optimized recs (only for shuffle-bound jobs) | — |
 | `--cost-optimized` | Generate only cost recommendations | both |
 | `--performance-optimized` | Generate only performance recommendations | both |
 | `--individual-files` | One JSON per job | single file |
