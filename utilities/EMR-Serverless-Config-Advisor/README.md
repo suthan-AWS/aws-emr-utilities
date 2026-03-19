@@ -285,7 +285,7 @@ ORDER BY total_memory_spilled_gb DESC;
 | `--input-path` | Path with extracted metrics (local or S3) | *required* |
 | `--output-cost` | Output file for cost-optimized recs | — |
 | `--output-perf` | Output file for performance-optimized recs | — |
-| `--output-io` | Output file for IO-optimized recs (only for shuffle-bound jobs) | — |
+| `--output-io` | Output file for IO-optimized recs (only for shuffle-bound jobs) | `recommendations_io_optimized.json` |
 | `--cost-optimized` | Generate only cost recommendations | both |
 | `--performance-optimized` | Generate only performance recommendations | both |
 | `--individual-files` | One JSON per job | single file |
