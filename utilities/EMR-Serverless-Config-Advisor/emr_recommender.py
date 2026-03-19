@@ -484,7 +484,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
                 disks_needed = max_exec_cost
             # Cap multiplier based on worker count: more workers = more N^2
             # network overhead, so prefer fewer larger workers
-            max_allowed = 2 if max_exec_cost > 100 else 4
+            max_allowed = 2 if max_exec_cost > 200 else 4
             io_exec_target = max(max_exec_cost, min(max_exec_cost * max_allowed, disks_needed))
             io_mult = max(1, round(io_exec_target / max_exec_cost)) if max_exec_cost > 0 else 0
             io_mult = min(io_mult, max_allowed)
