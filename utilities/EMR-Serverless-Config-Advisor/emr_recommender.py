@@ -482,12 +482,13 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
                 disks_needed = int(total_shuf_mb / (5 * target_sec) + 0.5)
             else:
                 disks_needed = max_exec_cost
-            # Cap at 4x cost executors (Large->Small is max downsize)
-            io_exec_target = max(max_exec_cost, min(max_exec_cost * 4, disks_needed))
+            # Cap multiplier based on worker count: more workers = more N^2
+            # network overhead, so prefer fewer larger workers
+            max_allowed = 2 if max_exec_cost > 100 else 4
+            io_exec_target = max(max_exec_cost, min(max_exec_cost * max_allowed, disks_needed))
             io_mult = max(1, round(io_exec_target / max_exec_cost)) if max_exec_cost > 0 else 0
-            io_mult = min(io_mult, 4)  # cap at 4x
+            io_mult = min(io_mult, max_allowed)
             io_target = DOWNSIZE_MAP.get((worker_type, io_mult))
-            # If exact mult not in map, try lower
             if not io_target and io_mult > 2:
                 io_target = DOWNSIZE_MAP.get((worker_type, 4)) or DOWNSIZE_MAP.get((worker_type, 2))
                 io_mult = 4 if DOWNSIZE_MAP.get((worker_type, 4)) else 2
