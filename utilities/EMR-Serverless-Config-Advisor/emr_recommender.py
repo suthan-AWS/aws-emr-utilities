@@ -142,8 +142,8 @@ def _select_worker_type(input_gb: float, shuffle_ratio: float,
 def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
                         mem_pct: float = 60.0, cpu_pct: float = 50.0,
                         idle_pct: float = 50.0, spill_gb: float = 0.0,
-                        mode: str = "cost", max_stage_tasks: int = 0,
-                        has_shuffle: bool = True) -> Tuple[int, int]:
+                        mode: str = "cost",
+                        orig_executors: int = 0, orig_cores: int = 0) -> Tuple[int, int]:
     req_input = max(1, int(input_gb / 100))
     part_divisor = 4 if mode == "cost" else 3
     req_part = max(1, int((partitions / vcpu) / part_divisor)) if partitions > 0 else 0
@@ -159,16 +159,19 @@ def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
     
     max_exec = max(2, int(base_req * factor))
 
-    # Task parallelism floor
-    if max_stage_tasks > 0 and spill_gb == 0:
+    # Original-run floor: if we know the original cluster size, don't go
+    # below a fraction of its total-core equivalent in the new worker size.
+    # Cost: scale down by CPU utilization (right-size to actual usage).
+    # Perf: match original core count (same throughput).
+    if orig_executors > 0 and orig_cores > 0:
+        orig_total_cores = orig_executors * orig_cores
         if mode == "performance":
-            task_floor = max(2, int(max_stage_tasks / vcpu / 3))
-        elif not has_shuffle:
-            # Cost mode: only for non-shuffle jobs (shuffle jobs use partition formula)
-            task_floor = max(2, int(max_stage_tasks / vcpu / 4))
+            equiv = max(2, int(orig_total_cores * 1.6 / vcpu))
         else:
-            task_floor = 0
-        max_exec = max(max_exec, task_floor)
+            # Right-size: if CPU was 40%, we only need 40% of original cores
+            util_factor = max(0.3, min(1.0, cpu_pct / 100.0))
+            equiv = max(2, int(orig_total_cores * util_factor / vcpu))
+        max_exec = max(max_exec, equiv)
 
     min_exec = max(1, max_exec // 2)
     
@@ -261,6 +264,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'max_stage_tasks': max((s.get('num_tasks', 0) for s in data.get('stage_summary', {}).get('stages', [])), default=0),
             'max_peak_memory_gb': util_data.get('max_peak_memory_gb', 0),
             'orig_executor_cores': int(data.get('spark_config', {}).get('spark.executor.cores', 0) or 0),
+            'orig_total_executors': int(util_data.get('total_executors', 0) or 0),
             'max_stage_shuffle_write_gb': data.get('shuffle_data_summary', {}).get('max_stage_shuffle_write_gb', 0),
             'shuffle_fetch_wait_percent': io_data.get('shuffle_fetch_wait_percent', 0),
         }
@@ -299,6 +303,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         max_stage_tasks = int(row.get('max_stage_tasks', 0) or 0)
         max_peak_mem_gb = float(row.get('max_peak_memory_gb', 0) or 0)
         orig_cores = int(row.get('orig_executor_cores', 0) or 0)
+        orig_executors = int(row.get('orig_total_executors', 0) or 0)
         max_stage_shuf_write = float(row.get('max_stage_shuffle_write_gb', 0) or 0)
         shuffle_fetch_wait_pct = float(row.get('shuffle_fetch_wait_percent', 0) or 0)
         
@@ -324,21 +329,25 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         
         # Cost-optimized
         max_exec_cost_init, min_exec_cost = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost", max_stage_tasks=max_stage_tasks, has_shuffle=has_shuffle
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
+            orig_executors=orig_executors, orig_cores=orig_cores
         )
         sp_cost, target_mib_cost = auto_tune_custom(shuffle_bytes, max_exec_cost_init)
         max_exec_cost, min_exec_cost = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost", max_stage_tasks=max_stage_tasks, has_shuffle=has_shuffle
+            i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
+            orig_executors=orig_executors, orig_cores=orig_cores
         )
         executor_disk_cost = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_cost)
         
         # Performance-optimized
         max_exec_perf_init, min_exec_perf = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance", max_stage_tasks=max_stage_tasks, has_shuffle=has_shuffle
+            i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance",
+            orig_executors=orig_executors, orig_cores=orig_cores
         )
         sp_perf, target_mib_perf = auto_tune_custom(shuffle_bytes, max_exec_perf_init)
         max_exec_perf, min_exec_perf = _compute_exec_limits(
-            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance", max_stage_tasks=max_stage_tasks, has_shuffle=has_shuffle
+            i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance",
+            orig_executors=orig_executors, orig_cores=orig_cores
         )
         executor_disk_perf = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_perf)
         
