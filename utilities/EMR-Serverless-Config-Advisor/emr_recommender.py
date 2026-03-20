@@ -374,7 +374,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             elif partitions > 2000 or max_exec > 100 or shuffle_gb > 2000:
                 return 8, 54
             elif partitions > 500 or max_exec > 50 or shuffle_gb > 500:
-                return 4, 28
+                return 4, 27
             else:
                 return 4, 14
 
