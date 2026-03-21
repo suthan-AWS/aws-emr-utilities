@@ -550,18 +550,9 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             # (the standard cost rec would just fail again)
             cost_recs[-1] = dict(io_rec)
             cost_recs[-1]["optimization_mode"] = "cost"
-            # Perf mode also needs enough disks — scale IO worker to perf executor count
-            perf_io_max = max_exec_perf * io_mult
-            perf_io_min = max(1, perf_io_max // 2)
-            perf_io_rec = dict(io_rec)
-            perf_io_rec["optimization_mode"] = "performance"
-            perf_io_rec["worker"] = dict(io_rec["worker"])
-            perf_io_rec["worker"]["max_executors"] = perf_io_max
-            perf_io_rec["worker"]["min_executors"] = perf_io_min
-            perf_io_rec["worker"]["total_vcpu_capacity"] = perf_io_max * io_r["vcpu"]
-            perf_io_rec["worker"]["total_memory_capacity"] = perf_io_max * io_mem
-            perf_io_rec["spark_configs"] = build_spark_cfg(perf_io_max, perf_io_min, sp_perf, io_disk, vcpu_override=io_r["vcpu"], mem_override=io_mem)
-            perf_recs[-1] = perf_io_rec
+            # Perf mode keeps original large workers — high executor count
+            # already provides enough disks, and larger workers give more
+            # vCPU per executor for faster task execution.
         # No IO rec for non-IO-bound jobs or already-Small workers
     
     # Process applications with no input data - recommend minimal config
