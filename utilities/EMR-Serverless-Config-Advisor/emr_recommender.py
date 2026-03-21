@@ -547,12 +547,18 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             })
             worker_cfg, worker_type = saved_cfg, saved_type
             # For IO-bound jobs, the IO config IS the cost-efficient config
-            # (the standard cost rec would just fail again)
             cost_recs[-1] = dict(io_rec)
             cost_recs[-1]["optimization_mode"] = "cost"
-            # Perf mode keeps original large workers — high executor count
-            # already provides enough disks, and larger workers give more
-            # vCPU per executor for faster task execution.
+            # Perf mode keeps original large workers for more vCPU per executor,
+            # but must have at least as many disks (executors) as cost mode.
+            if max_exec_perf < io_max:
+                max_exec_perf = io_max
+                min_exec_perf = max(1, max_exec_perf // 2)
+                perf_recs[-1]["worker"]["max_executors"] = max_exec_perf
+                perf_recs[-1]["worker"]["min_executors"] = min_exec_perf
+                perf_recs[-1]["worker"]["total_vcpu_capacity"] = max_exec_perf * worker_cfg["vcpu"]
+                perf_recs[-1]["worker"]["total_memory_capacity"] = max_exec_perf * worker_cfg["memory"]
+                perf_recs[-1]["spark_configs"] = build_spark_cfg(max_exec_perf, min_exec_perf, sp_perf, executor_disk_perf)
         # No IO rec for non-IO-bound jobs or already-Small workers
     
     # Process applications with no input data - recommend minimal config
