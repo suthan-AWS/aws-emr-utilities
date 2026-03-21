@@ -550,18 +550,16 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             cost_recs[-1] = dict(io_rec)
             cost_recs[-1]["optimization_mode"] = "cost"
             # Perf mode: keep large workers if they already have enough disks.
-            # Otherwise, find the largest worker type that meets the disk target
-            # while preserving total core count.
+            # Otherwise, find the smallest worker type that meets the disk target
+            # while preserving total core count — smaller workers are cheaper.
             if max_exec_perf < io_max:
                 perf_orig_cores = max_exec_perf * worker_cfg["vcpu"]
-                # Try each size from Large down — pick the biggest that has enough disks
                 best = None
-                for try_type in ["Large", "Medium", "Small"]:
+                for try_type in ["Small", "Medium", "Large"]:
                     tr = WORKER_RANGES_IO[try_type]
                     need_exec = io_max  # must match cost disk count
                     total_cores = need_exec * tr["vcpu"]
                     if total_cores >= perf_orig_cores:
-                        # This size gives enough disks AND enough cores
                         per_task_mem = worker_cfg["memory"] / worker_cfg["vcpu"]
                         tmem = int(per_task_mem * tr["vcpu"])
                         tmem = max(tr["min_mem"], min(tr["max_mem"], tmem))
