@@ -378,13 +378,15 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             else:
                 return 4, 14
 
-        def build_spark_cfg(max_exec, min_exec, sp, executor_disk):
+        def build_spark_cfg(max_exec, min_exec, sp, executor_disk, vcpu_override=None, mem_override=None):
             d_cores, d_mem = _driver_sizing(sp, max_exec, s_in_gb + s_out_gb)
+            vcpu = vcpu_override or worker_cfg["vcpu"]
+            mem = mem_override or worker_cfg["memory"]
             cfg = {
                 "spark.driver.cores": str(d_cores),
                 "spark.driver.memory": f"{d_mem}G",
-                "spark.executor.cores": str(worker_cfg["vcpu"]),
-                "spark.executor.memory": f"{worker_cfg['memory']}g",
+                "spark.executor.cores": str(vcpu),
+                "spark.executor.memory": f"{mem}g",
                 "spark.dynamicAllocation.enabled": "true",
                 "spark.sql.adaptive.enabled": "true",
                 "spark.sql.files.maxPartitionBytes": _max_partition_bytes(i_in_gb),
@@ -558,7 +560,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             perf_io_rec["worker"]["min_executors"] = perf_io_min
             perf_io_rec["worker"]["total_vcpu_capacity"] = perf_io_max * io_r["vcpu"]
             perf_io_rec["worker"]["total_memory_capacity"] = perf_io_max * io_mem
-            perf_io_rec["spark_configs"] = build_spark_cfg(perf_io_max, perf_io_min, sp_perf, io_disk)
+            perf_io_rec["spark_configs"] = build_spark_cfg(perf_io_max, perf_io_min, sp_perf, io_disk, vcpu_override=io_r["vcpu"], mem_override=io_mem)
             perf_recs[-1] = perf_io_rec
         # No IO rec for non-IO-bound jobs or already-Small workers
     
