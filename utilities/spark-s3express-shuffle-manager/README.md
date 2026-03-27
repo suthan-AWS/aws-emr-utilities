@@ -1,6 +1,6 @@
 # Spark S3 Express Shuffle Manager
 
-A drop-in Apache Spark ShuffleManager that stores shuffle data on [Amazon S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) instead of local disk. Provides **spot instance resilience** (zero FetchFailed errors on executor loss) while achieving performance close to local EBS storage.
+A drop-in Apache Spark ShuffleManager that stores shuffle data on [Amazon S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) instead of local disk. Provides **spot instance resilience** (zero FetchFailed errors on executor loss).
 
 ## Features
 
