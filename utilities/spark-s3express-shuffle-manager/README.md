@@ -182,7 +182,7 @@ The plugin replaces Spark's `SortShuffleManager` with `CloudShuffleManager` whic
 
 ## Limitations
 
-- Performance is ~2x local EBS due to S3 latency (~5ms per GET vs <1ms local)
+- Performance is ~2x local EBS gp2 based on TPC-DS 3TB benchmark (30 min vs 15.7 min per iteration)
 - S3 Express directory bucket must be in the same Availability Zone as the cluster
 
 ## License
