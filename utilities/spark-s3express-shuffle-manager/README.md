@@ -66,8 +66,7 @@ spark-submit --deploy-mode client \
 | `spark.shuffle.storage.path` | `s3a://<directory-bucket>/shuffle/` | S3 Express directory bucket path for shuffle data |
 | `spark.shuffle.storage.s3express.enabled` | `true` | Enables S3 Express optimizations |
 | `spark.shuffle.storage.s3express.endpoint.region` | e.g. `us-east-1` | Region of the directory bucket |
-| `spark.shuffle.service.enabled` | `false` | Must be disabled (no external shuffle service needed) |
-| `spark.dynamicAllocation.enabled` | `false` | Recommended for consistent performance; dynamic allocation is supported since shuffle data persists on S3 |
+| `spark.shuffle.service.enabled` | `false` | Must be disabled (shuffle data is on S3, not local disk) |
 
 ### Recommended
 
