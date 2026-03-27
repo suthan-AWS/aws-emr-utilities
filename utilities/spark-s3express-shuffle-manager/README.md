@@ -67,7 +67,7 @@ spark-submit --deploy-mode client \
 | `spark.shuffle.storage.s3express.enabled` | `true` | Enables S3 Express optimizations |
 | `spark.shuffle.storage.s3express.endpoint.region` | e.g. `us-east-1` | Region of the directory bucket |
 | `spark.shuffle.service.enabled` | `false` | Must be disabled (no external shuffle service needed) |
-| `spark.dynamicAllocation.enabled` | `false` | Must be disabled (static executor allocation) |
+| `spark.dynamicAllocation.enabled` | `false` | Recommended for consistent performance; dynamic allocation is supported since shuffle data persists on S3 |
 
 ### Recommended
 
@@ -182,8 +182,6 @@ The plugin replaces Spark's `SortShuffleManager` with `CloudShuffleManager` whic
 
 ## Limitations
 
-- Requires static executor allocation (`spark.dynamicAllocation.enabled=false`)
-- Driver needs large heap (64g recommended) for shuffle metadata storage
 - Performance is ~2x local EBS due to S3 latency (~5ms per GET vs <1ms local)
 - S3 Express directory bucket must be in the same Availability Zone as the cluster
 
