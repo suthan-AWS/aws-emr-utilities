@@ -143,12 +143,15 @@ def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
                         mem_pct: float = 60.0, cpu_pct: float = 50.0,
                         idle_pct: float = 50.0, spill_gb: float = 0.0,
                         mode: str = "cost",
-                        orig_executors: int = 0, orig_cores: int = 0) -> Tuple[int, int]:
+                        orig_executors: int = 0, orig_cores: int = 0,
+                        total_task_exec_hours: float = 0,
+                        duration_hours: float = 0,
+                        stages: list = None) -> Tuple[int, int]:
     req_input = max(1, int(input_gb / 100))
     part_divisor = 4 if mode == "cost" else 3
     req_part = max(1, int((partitions / vcpu) / part_divisor)) if partitions > 0 else 0
     base_req = max(req_input, req_part)
-    
+
     # Pressure factor based on spill (stable workload property)
     spill_ratio = (spill_gb / max(input_gb, 1)) * 100
     spill_pressure = min(40, spill_ratio * 0.2)
@@ -156,25 +159,44 @@ def _compute_exec_limits(input_gb: float, vcpu: int, partitions: int = 0,
         factor = 1.0 + (spill_pressure / 100) * 0.5
     else:
         factor = 0.8 + (spill_pressure / 100) * 0.5
-    
+
     max_exec = max(2, int(base_req * factor))
 
-    # Original-run floor: if we know the original cluster size, don't go
-    # below a fraction of its total-core equivalent in the new worker size.
-    # Cost: scale down by CPU utilization (right-size to actual usage).
-    # Perf: match original core count (same throughput).
-    if orig_executors > 0 and orig_cores > 0:
+    # --- Work-based sizing (primary signal) ---
+    # Uses actual observed task execution time to determine how many cores
+    # are needed, independent of the original cluster size.
+    if total_task_exec_hours > 0 and duration_hours > 0:
+        if mode == "cost":
+            # Allow 3x original duration — trade time for fewer executors
+            target_hours = duration_hours * 3
+        else:
+            # Match original duration
+            target_hours = duration_hours
+
+        cores_needed = total_task_exec_hours / target_hours
+        work_exec = max(2, int(cores_needed / vcpu))
+
+        # Efficiency discount: when idle% is very high, the original run was
+        # over-parallelized — task overhead (scheduling, serialization, GC)
+        # inflates total_task_exec_hours. Fewer executors = less overhead.
+        if idle_pct > 70:
+            efficiency = max(0.3, 1.0 - (idle_pct - 50) / 100)
+            work_exec = max(2, int(work_exec * efficiency))
+
+        max_exec = max(max_exec, work_exec)
+
+    # --- Fallback: original-run floor (only when task data is missing) ---
+    elif orig_executors > 0 and orig_cores > 0:
         orig_total_cores = orig_executors * orig_cores
         if mode == "performance":
             equiv = max(2, int(orig_total_cores * 1.6 / vcpu))
         else:
-            # Right-size: if CPU was 40%, we only need 40% of original cores
             util_factor = max(0.3, min(1.0, cpu_pct / 100.0))
             equiv = max(2, int(orig_total_cores * util_factor / vcpu))
         max_exec = max(max_exec, equiv)
 
     min_exec = max(1, max_exec // 2)
-    
+
     return max_exec, min_exec
 
 
@@ -265,6 +287,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'max_peak_memory_gb': util_data.get('max_peak_memory_gb', 0),
             'orig_executor_cores': int(data.get('spark_config', {}).get('spark.executor.cores', 0) or 0),
             'orig_total_executors': int(util_data.get('total_executors', 0) or 0),
+            'total_task_execution_hours': util_data.get('total_task_execution_hours', 0),
             'max_stage_shuffle_write_gb': data.get('shuffle_data_summary', {}).get('max_stage_shuffle_write_gb', 0),
             'shuffle_fetch_wait_percent': io_data.get('shuffle_fetch_wait_percent', 0),
         }
@@ -304,6 +327,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         max_peak_mem_gb = float(row.get('max_peak_memory_gb', 0) or 0)
         orig_cores = int(row.get('orig_executor_cores', 0) or 0)
         orig_executors = int(row.get('orig_total_executors', 0) or 0)
+        total_task_exec_hours = float(row.get('total_task_execution_hours', 0) or 0)
         max_stage_shuf_write = float(row.get('max_stage_shuffle_write_gb', 0) or 0)
         shuffle_fetch_wait_pct = float(row.get('shuffle_fetch_wait_percent', 0) or 0)
         
@@ -330,24 +354,28 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         # Cost-optimized
         max_exec_cost_init, min_exec_cost = _compute_exec_limits(
             i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
-            orig_executors=orig_executors, orig_cores=orig_cores
+            orig_executors=orig_executors, orig_cores=orig_cores,
+            total_task_exec_hours=total_task_exec_hours, duration_hours=duration,
         )
         sp_cost, target_mib_cost = auto_tune_custom(shuffle_bytes, max_exec_cost_init)
         max_exec_cost, min_exec_cost = _compute_exec_limits(
             i_in_gb, worker_cfg["vcpu"], sp_cost, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
-            orig_executors=orig_executors, orig_cores=orig_cores
+            orig_executors=orig_executors, orig_cores=orig_cores,
+            total_task_exec_hours=total_task_exec_hours, duration_hours=duration,
         )
         executor_disk_cost = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_cost)
         
         # Performance-optimized
         max_exec_perf_init, min_exec_perf = _compute_exec_limits(
             i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance",
-            orig_executors=orig_executors, orig_cores=orig_cores
+            orig_executors=orig_executors, orig_cores=orig_cores,
+            total_task_exec_hours=total_task_exec_hours, duration_hours=duration,
         )
         sp_perf, target_mib_perf = auto_tune_custom(shuffle_bytes, max_exec_perf_init)
         max_exec_perf, min_exec_perf = _compute_exec_limits(
             i_in_gb, worker_cfg["vcpu"], sp_perf, mem_pct, cpu_pct, idle_pct, spill_gb, mode="performance",
-            orig_executors=orig_executors, orig_cores=orig_cores
+            orig_executors=orig_executors, orig_cores=orig_cores,
+            total_task_exec_hours=total_task_exec_hours, duration_hours=duration,
         )
         executor_disk_perf = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_perf)
         
