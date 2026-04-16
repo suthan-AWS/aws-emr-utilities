@@ -381,6 +381,19 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             if partitions % 2 != 0:
                 partitions += 1
             return partitions, target_mib
+
+        def cap_partitions(partitions, max_executors):
+            """Cap excessive partition counts to prevent N^2 shuffle
+            coordination overhead on Serverless.
+            Only triggers when partitions > 5000 AND P/E > 40.
+            Observed: 10006 parts / 156 exec (P/E=64) failed with 64% fetch wait;
+                      1304 parts / 124 exec (P/E=11) succeeded with 37% fetch wait.
+            Caps to P/E=24 (observed safe operating point)."""
+            if partitions > 6400 and max_executors > 0 and partitions / max_executors > 48:
+                partitions = max_executors * 24
+                if partitions % 2 != 0:
+                    partitions += 1
+            return partitions
         
         # --- WindowGroupLimit skew detection ---
         stages_raw = row.get('_stages_raw', [])
@@ -399,6 +412,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             orig_executors=orig_executors, orig_cores=orig_cores,
             total_task_exec_hours=total_task_exec_hours, duration_hours=duration,
         )
+        sp_cost = cap_partitions(sp_cost, max_exec_cost)
         executor_disk_cost = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_cost)
         
         # Performance-optimized
@@ -413,6 +427,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             orig_executors=orig_executors, orig_cores=orig_cores,
             total_task_exec_hours=total_task_exec_hours, duration_hours=duration,
         )
+        sp_perf = cap_partitions(sp_perf, max_exec_perf)
         executor_disk_perf = _calculate_executor_disk(s_out_gb, disk_spill_gb, spill_gb, max_exec_perf)
         
         # Build base metrics
