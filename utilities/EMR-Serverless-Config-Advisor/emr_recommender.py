@@ -253,6 +253,36 @@ def _get_iceberg_configs() -> Dict[str, str]:
     }
 
 
+
+def _detect_window_group_limit_skew(stages, duration_min):
+    """Detect WindowGroupLimit-induced skew: few tasks, long duration, high spill/skew."""
+    findings = []
+    for s in stages:
+        num_tasks = s.get('num_tasks', 0)
+        duration_sec = s.get('duration_sec', 0) or 0
+        total_task_time = s.get('total_task_time_sec', 0) or 0
+        mem_spill_gb = s.get('mem_spill_gb', 0) or 0
+        if num_tasks == 0 or duration_sec == 0 or total_task_time == 0:
+            continue
+        avg_task_time = total_task_time / num_tasks
+        skew_ratio = duration_sec / avg_task_time if avg_task_time > 0 else 0
+        is_few_tasks = num_tasks < 50
+        is_long = duration_sec > 1800
+        is_skewed = skew_ratio > 5.0
+        has_spill = mem_spill_gb > 100
+        if is_few_tasks and is_long and (is_skewed or has_spill):
+            pct_of_job = (duration_sec / 60) / duration_min * 100 if duration_min > 0 else 0
+            findings.append({
+                'stage_id': s.get('stage_id'),
+                'num_tasks': num_tasks,
+                'duration_min': round(duration_sec / 60, 1),
+                'skew_ratio': round(skew_ratio, 1),
+                'mem_spill_gb': round(mem_spill_gb, 1),
+                'pct_of_job': round(pct_of_job, 1),
+            })
+    return findings
+
+
 def generate_dual_recommendations(input_path: str, limit: int = 100,
                                   target_partition_size_mib: int = 1024,
                                   serverless_storage: bool = False) -> Tuple[List[Dict], List[Dict]]:
@@ -290,6 +320,7 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'total_task_execution_hours': util_data.get('total_task_execution_hours', 0),
             'max_stage_shuffle_write_gb': data.get('shuffle_data_summary', {}).get('max_stage_shuffle_write_gb', 0),
             'shuffle_fetch_wait_percent': io_data.get('shuffle_fetch_wait_percent', 0),
+            '_stages_raw': data.get('stage_summary', {}).get('stages', []),
         }
         flattened.append(flat)
     
@@ -351,6 +382,11 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
                 partitions += 1
             return partitions, target_mib
         
+        # --- WindowGroupLimit skew detection ---
+        stages_raw = row.get('_stages_raw', [])
+        duration_min_raw = duration * 60
+        window_skew_findings = _detect_window_group_limit_skew(stages_raw, duration_min_raw)
+
         # Cost-optimized
         max_exec_cost_init, min_exec_cost = _compute_exec_limits(
             i_in_gb, worker_cfg["vcpu"], 0, mem_pct, cpu_pct, idle_pct, spill_gb, mode="cost",
@@ -493,6 +529,27 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             },
         })
         
+        # Inject WindowGroupLimit recommendation if detected
+        if window_skew_findings:
+            excluded_rule = 'org.apache.spark.sql.catalyst.optimizer.InferWindowGroupLimit'
+            cost_rec['bottleneck_warnings'] = [{
+                'type': 'window_group_limit_skew',
+                'severity': 'HIGH',
+                'message': f'Stage(s) with extreme skew from InferWindowGroupLimit optimizer rule. '
+                           f'{len(window_skew_findings)} stage(s) affected, '
+                           f'worst: stage {window_skew_findings[0]["stage_id"]} '
+                           f'({window_skew_findings[0]["pct_of_job"]}% of job time, '
+                           f'{window_skew_findings[0]["skew_ratio"]}x skew ratio).',
+                'recommendation': f'spark.sql.optimizer.excludedRules={excluded_rule}',
+                'affected_stages': window_skew_findings,
+            }]
+            perf_rec['bottleneck_warnings'] = cost_rec['bottleneck_warnings']
+            # Add to spark_configs
+            existing = cost_rec['spark_configs'].get('spark.sql.optimizer.excludedRules', '')
+            rules = f'{existing},{excluded_rule}' if existing else excluded_rule
+            cost_rec['spark_configs']['spark.sql.optimizer.excludedRules'] = rules
+            perf_rec['spark_configs']['spark.sql.optimizer.excludedRules'] = rules
+
         cost_recs.append(cost_rec)
         perf_recs.append(perf_rec)
 
@@ -575,8 +632,14 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             })
             worker_cfg, worker_type = saved_cfg, saved_type
             # For IO-bound jobs, the IO config IS the cost-efficient config
+            saved_warnings = cost_recs[-1].get('bottleneck_warnings')
             cost_recs[-1] = dict(io_rec)
             cost_recs[-1]["optimization_mode"] = "cost"
+            if saved_warnings:
+                cost_recs[-1]['bottleneck_warnings'] = saved_warnings
+                excluded = saved_warnings[0].get('recommendation', '')
+                if excluded:
+                    cost_recs[-1]['spark_configs'][excluded.split('=')[0]] = excluded.split('=', 1)[1]
             # Perf mode: keep large workers if they already have enough disks.
             # Otherwise, find the smallest worker type that meets the disk target
             # while preserving total core count — smaller workers are cheaper.
