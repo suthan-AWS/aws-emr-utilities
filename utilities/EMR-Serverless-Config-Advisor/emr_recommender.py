@@ -383,16 +383,17 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             return partitions, target_mib
 
         def cap_partitions(partitions, max_executors):
-            """Cap excessive partition counts to prevent N^2 shuffle
-            coordination overhead on Serverless.
-            Only triggers when partitions > 5000 AND P/E > 40.
-            Observed: 10006 parts / 156 exec (P/E=64) failed with 64% fetch wait;
-                      1304 parts / 124 exec (P/E=11) succeeded with 37% fetch wait.
-            Caps to P/E=24 (observed safe operating point)."""
-            if partitions > 6400 and max_executors > 0 and partitions / max_executors > 48:
-                partitions = max_executors * 24
-                if partitions % 2 != 0:
-                    partitions += 1
+            """Cap partitions based on executor IO concurrency, with a
+            data volume floor to prevent oversized partitions."""
+            io_ceiling = max(200, max_executors * 8)
+            # Data floor: ensure partitions don't exceed 3x memory per core
+            mem_per_core = worker_cfg["memory"] / worker_cfg["vcpu"]
+            max_gb_per_part = mem_per_core * 3
+            data_floor = max(2, int((s_in_gb + s_out_gb) / max_gb_per_part)) if max_gb_per_part > 0 else 200
+            # Apply: at least the data floor, at most the IO ceiling
+            partitions = max(data_floor, min(partitions, io_ceiling))
+            if partitions % 2 != 0:
+                partitions += 1
             return partitions
         
         # --- WindowGroupLimit skew detection ---
