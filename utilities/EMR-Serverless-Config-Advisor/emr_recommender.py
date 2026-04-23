@@ -283,6 +283,33 @@ def _detect_window_group_limit_skew(stages, duration_min):
     return findings
 
 
+
+def _detect_window_group_limit_coalesce_regression(stages, sql_executions, executor_summary):
+    """Detect WindowGroupLimit regression from AQE coalescing imbalance."""
+    has_window = any('Window ' in (sq.get('physical_plan_description', '') or '') or
+                     'Window[' in (sq.get('physical_plan_description', '') or '')
+                     for sq in sql_executions)
+    if not has_window:
+        return False
+    small_coalesced = [s for s in stages if 1 < s.get('num_tasks', 0) < 100]
+    if len(small_coalesced) <= 10:
+        return False
+    fetch_failed_large = [s for s in stages
+                          if s.get('failure_reason')
+                          and 'FetchFailed' in (s.get('failure_reason') or '')
+                          and s.get('num_tasks', 0) > 500]
+    if not fetch_failed_large:
+        return False
+    nearby = sum(1 for sm in small_coalesced for fl in fetch_failed_large
+                 if abs(sm['stage_id'] - fl['stage_id']) <= 30)
+    if nearby <= 5:
+        return False
+    dead = executor_summary.get('dead_executors', 0)
+    total = executor_summary.get('total_executors', 1)
+    if total > 0 and dead / total >= 0.10:
+        return False
+    return True
+
 def generate_dual_recommendations(input_path: str, limit: int = 100,
                                   target_partition_size_mib: int = 1024,
                                   serverless_storage: bool = False) -> Tuple[List[Dict], List[Dict]]:
@@ -321,6 +348,8 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
             'max_stage_shuffle_write_gb': data.get('shuffle_data_summary', {}).get('max_stage_shuffle_write_gb', 0),
             'shuffle_fetch_wait_percent': io_data.get('shuffle_fetch_wait_percent', 0),
             '_stages_raw': data.get('stage_summary', {}).get('stages', []),
+            '_sql_executions_raw': data.get('sql_executions', []),
+            '_executor_summary_raw': data.get('executor_summary', {}),
         }
         flattened.append(flat)
     
@@ -400,6 +429,8 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         stages_raw = row.get('_stages_raw', [])
         duration_min_raw = duration * 60
         window_skew_findings = _detect_window_group_limit_skew(stages_raw, duration_min_raw)
+        window_coalesce_regression = _detect_window_group_limit_coalesce_regression(
+            stages_raw, row.get('_sql_executions_raw', []), row.get('_executor_summary_raw', {}))
 
         # Cost-optimized
         max_exec_cost_init, min_exec_cost = _compute_exec_limits(
@@ -546,18 +577,22 @@ def generate_dual_recommendations(input_path: str, limit: int = 100,
         })
         
         # Inject WindowGroupLimit recommendation if detected
-        if window_skew_findings:
+        if window_skew_findings or window_coalesce_regression:
             excluded_rule = 'org.apache.spark.sql.catalyst.optimizer.InferWindowGroupLimit'
+            wgl_type = 'window_group_limit_skew' if window_skew_findings else 'window_group_limit_coalesce_regression'
+            wgl_msg = (f'Stage(s) with extreme skew from InferWindowGroupLimit optimizer rule. '
+                       f'{len(window_skew_findings)} stage(s) affected, '
+                       f'worst: stage {window_skew_findings[0]["stage_id"]} '
+                       f'({window_skew_findings[0]["pct_of_job"]}% of job time, '
+                       f'{window_skew_findings[0]["skew_ratio"]}x skew ratio).') if window_skew_findings else (
+                       'InferWindowGroupLimit causing AQE coalescing imbalance with window functions. '
+                       'Small coalesced stages near failed shuffle stages indicate uneven partition distributions.')
             cost_rec['bottleneck_warnings'] = [{
-                'type': 'window_group_limit_skew',
+                'type': wgl_type,
                 'severity': 'HIGH',
-                'message': f'Stage(s) with extreme skew from InferWindowGroupLimit optimizer rule. '
-                           f'{len(window_skew_findings)} stage(s) affected, '
-                           f'worst: stage {window_skew_findings[0]["stage_id"]} '
-                           f'({window_skew_findings[0]["pct_of_job"]}% of job time, '
-                           f'{window_skew_findings[0]["skew_ratio"]}x skew ratio).',
+                'message': wgl_msg,
                 'recommendation': f'spark.sql.optimizer.excludedRules={excluded_rule}',
-                'affected_stages': window_skew_findings,
+                'affected_stages': window_skew_findings if window_skew_findings else [],
             }]
             perf_rec['bottleneck_warnings'] = cost_rec['bottleneck_warnings']
             # Add to spark_configs
