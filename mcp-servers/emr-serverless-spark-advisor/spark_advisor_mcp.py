@@ -575,6 +575,50 @@ def compare_sql_execution_plans(app_id_1: str, sql_id_1: int, app_id_2: str, sql
     }, indent=2)
 
 
+# ── EMR Serverless Configuration Recommendations ───────────────────
+
+@mcp.tool()
+def generate_emr_serverless_config_recommendations(
+    mode: str = "cost-optimized",
+    target_partition_size_mib: int = 1024,
+) -> str:
+    """Generate EMR Serverless configuration recommendations with worker sizing, Spark configs, and shuffle tuning.
+
+    Uses extracted metrics (run analyze_spark_logs first) to produce ready-to-use
+    Spark configurations including executor/driver sizing, shuffle partitions,
+    dynamic allocation limits, disk sizing, and bottleneck warnings.
+
+    Args:
+        mode: 'cost-optimized' or 'performance-optimized'
+        target_partition_size_mib: Target shuffle partition size in MiB (default 1024)
+
+    Returns:
+        JSON with per-application recommendations including spark_configs, worker sizing, and shuffle tuning.
+    """
+    from emr_recommender import generate_dual_recommendations
+
+    output = _output_path()
+    if not output:
+        return json.dumps({"error": "OUTPUT_S3_PATH not configured."})
+
+    try:
+        cost_recs, perf_recs = generate_dual_recommendations(
+            output, target_partition_size_mib=target_partition_size_mib
+        )
+    except Exception as e:
+        return json.dumps({"error": f"Recommendation generation failed: {e}"})
+
+    recs = cost_recs if mode == "cost-optimized" else perf_recs
+    if not recs:
+        return json.dumps({"error": "No extracted data found. Run analyze_spark_logs first."})
+
+    return json.dumps({
+        "mode": mode,
+        "application_count": len(recs),
+        "recommendations": recs,
+    }, indent=2)
+
+
 if __name__ == "__main__":
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     if transport == "stdio":
