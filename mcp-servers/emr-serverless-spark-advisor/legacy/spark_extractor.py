@@ -96,13 +96,11 @@ def phase_a_decompress(input_path, local_base, limit, workers=50):
     print(f"Phase A: Decompressing {len(app_prefixes)} apps, {len(all_tasks)} files with {workers} threads")
     os.makedirs(local_base, exist_ok=True)
 
-    # Open output files
-    app_files = {}
+    # Collect decompressed text per app in memory
+    app_buffers = {}
     app_counts = {}
     for _, app_name in app_prefixes:
-        d = os.path.join(local_base, app_name)
-        os.makedirs(d, exist_ok=True)
-        app_files[app_name] = open(os.path.join(d, "events.jsonl"), "w")
+        app_buffers[app_name] = []
         app_counts[app_name] = 0
 
     start = time.time()
@@ -112,30 +110,48 @@ def phase_a_decompress(input_path, local_base, limit, workers=50):
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for app_name, text in pool.map(_decompress_one_file, all_tasks):
             if text:
-                f = app_files[app_name]
                 for line in text.splitlines():
                     line = line.strip()
                     if line:
-                        f.write(line + "\n")
+                        app_buffers[app_name].append(line)
                         app_counts[app_name] += 1
             completed += 1
             if completed % 50 == 0 or completed == len(all_tasks):
                 print(f"  Decompressing... {completed}/{len(all_tasks)} files", flush=True)
 
-    for f in app_files.values():
-        f.close()
+    # Write to local disk AND S3 staging.
+    # EMR Serverless runs driver and executors in separate containers,
+    # so Spark tasks cannot read file:// paths written by the driver.
+    # S3 staging makes the decompressed data accessible to all workers.
+    s3_upload = boto3.client("s3", region_name="us-east-1")
+    staging_prefix = local_base.lstrip("/")
+    for app_name, lines in app_buffers.items():
+        content = "\n".join(lines) + "\n" if lines else ""
+        # Local disk (for non-EMR-Serverless environments)
+        d = os.path.join(local_base, app_name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "events.jsonl"), "w") as f:
+            f.write(content)
+        # S3 staging (for EMR Serverless)
+        if content:
+            try:
+                s3_upload.put_object(
+                    Bucket=bucket, Key=f"{staging_prefix}/{app_name}/events.jsonl",
+                    Body=content.encode("utf-8"), ContentType="application/x-ndjson")
+            except Exception as e:
+                print(f"  Warning: S3 staging upload for {app_name}: {e}", file=sys.stderr)
 
     elapsed = time.time() - start
     total_lines = sum(app_counts.values())
     for app_name, count in app_counts.items():
         print(f"  ✓ {app_name}: {count} events")
     print(f"Phase A done: {len(app_prefixes)} apps, {total_lines} events in {elapsed:.1f}s")
-    return list(app_counts.keys())
+    return list(app_counts.keys()), bucket, staging_prefix
 
 
 # ── Phase B: Spark extraction ────────────────────────────────────────
 
-def phase_b_spark_extract(app_names, local_base, output_path, limit):
+def phase_b_spark_extract(app_names, local_base, output_path, limit, s3_staging_bucket=None, s3_staging_prefix=None):
     """Use Spark to read decompressed JSON and extract metrics."""
     from pyspark.sql import SparkSession, functions as F
 
@@ -153,30 +169,31 @@ def phase_b_spark_extract(app_names, local_base, output_path, limit):
     total_apps = min(limit, len(app_names))
     print(f"\nPhase B: Extracting metrics from {total_apps} apps using Spark", flush=True)
 
+    # Prefer S3 staging (works on EMR Serverless), fall back to local disk
+    def _read_path(app_id):
+        if s3_staging_bucket and s3_staging_prefix:
+            return f"s3://{s3_staging_bucket}/{s3_staging_prefix}/{app_id}/events.jsonl"
+        return "file://" + os.path.join(local_base, app_id, "events.jsonl")
+
     # Infer schema once from the first app, reuse for all others
     schema = None
     first_path = None
     for app_id in app_names[:limit]:
-        p = os.path.join(local_base, app_id, "events.jsonl")
-        if os.path.exists(p) and os.path.getsize(p) > 0:
-            first_path = "file://" + p
-            break
+        first_path = _read_path(app_id)
+        break
     if first_path:
         schema = spark.read.json(first_path).schema
         print(f"Schema inferred ({len(schema.fields)} fields), reusing for all apps")
 
     for idx, app_id in enumerate(app_names[:limit], 1):
-        jsonl_path = os.path.join(local_base, app_id, "events.jsonl")
-        if not os.path.exists(jsonl_path) or os.path.getsize(jsonl_path) == 0:
-            print(f"  Skip {app_id}: no data")
-            continue
+        read_path = _read_path(app_id)
 
         print(f"  [{idx}/{min(limit, len(app_names))}] Extracting {app_id}...", flush=True)
         try:
             if schema:
-                df = spark.read.schema(schema).json("file://" + jsonl_path)
+                df = spark.read.schema(schema).json(read_path)
             else:
-                df = spark.read.json("file://" + jsonl_path)
+                df = spark.read.json(read_path)
             df.cache()
             total_events = df.count()
 
@@ -600,10 +617,11 @@ if __name__ == "__main__":
     start = time.time()
 
     # Phase A: Python decompress
-    app_names = phase_a_decompress(args.input, LOCAL_STAGING, args.limit, args.decompress_workers)
+    app_names, staging_bucket, staging_prefix = phase_a_decompress(args.input, LOCAL_STAGING, args.limit, args.decompress_workers)
 
     # Phase B: Spark extract
-    phase_b_spark_extract(app_names, LOCAL_STAGING, args.output, args.limit)
+    phase_b_spark_extract(app_names, LOCAL_STAGING, args.output, args.limit,
+                          s3_staging_bucket=staging_bucket, s3_staging_prefix=staging_prefix)
 
     elapsed = time.time() - start
     print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
