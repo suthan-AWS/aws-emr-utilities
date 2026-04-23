@@ -84,7 +84,7 @@ def _submit_job(input_path, output_path):
             "entryPointArguments": args,
             "sparkSubmitParameters": (
                 "--conf spark.executor.cores=8 "
-                "--conf spark.executor.memory=60g "
+                "--conf spark.executor.memory=54g "
                 "--conf spark.driver.cores=8 "
                 "--conf spark.driver.memory=16g "
                 "--conf spark.dynamicAllocation.maxExecutors=100 "
@@ -93,7 +93,11 @@ def _submit_job(input_path, output_path):
         }
     }
     if ARCHIVES_PATH:
-        job_params["sparkSubmit"]["sparkSubmitParameters"] += f" --archives {ARCHIVES_PATH}#zstandard_lib"
+        job_params["sparkSubmit"]["sparkSubmitParameters"] += (
+            f" --archives {ARCHIVES_PATH}#zstandard_lib"
+            " --conf spark.emr-serverless.driverEnv.PYTHONPATH=./zstandard_lib"
+            " --conf spark.executorEnv.PYTHONPATH=./zstandard_lib"
+        )
 
     resp = emr.start_job_run(
         applicationId=APP_ID,
