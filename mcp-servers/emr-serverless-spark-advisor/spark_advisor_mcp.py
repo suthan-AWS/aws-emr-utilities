@@ -137,8 +137,20 @@ def _submit_parallel_jobs(app_prefixes, output_path):
     return results
 
 def _discover_apps(input_path):
-    """List app prefixes under an S3 path."""
-    bucket, prefix = _s3_parts(input_path.rstrip("/") + "/")
+    """List app prefixes under an S3 path. Handles directories, single apps, and zip files."""
+    bucket, prefix = _s3_parts(input_path.rstrip("/"))
+
+    # Handle zip files: download, extract, upload contents, return discovered apps
+    if prefix.endswith(".zip"):
+        return _extract_zip_to_s3(bucket, prefix)
+
+    prefix = prefix.rstrip("/") + "/"
+
+    # Check if input_path itself is a single app directory
+    dir_name = prefix.rstrip("/").split("/")[-1]
+    if dir_name.startswith("eventlog_v2_") or dir_name.startswith("application_"):
+        return [f"{bucket}/{prefix}"]
+
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/")
     apps = []
     for cp in resp.get("CommonPrefixes", []):
@@ -147,6 +159,45 @@ def _discover_apps(input_path):
         if name.startswith("eventlog_v2_") or name.startswith("application_"):
             apps.append(f"{bucket}/{p}")
     return apps
+
+
+def _extract_zip_to_s3(bucket, zip_key):
+    """Download a zip from S3, extract it, upload event log dirs back to S3."""
+    import zipfile, tempfile, io
+
+    log.info("Downloading zip s3://%s/%s", bucket, zip_key)
+    zip_obj = s3.get_object(Bucket=bucket, Key=zip_key)["Body"].read()
+
+    # Determine upload prefix: same directory as the zip, under extracted/
+    zip_dir = "/".join(zip_key.split("/")[:-1])
+    zip_name = zip_key.split("/")[-1].replace(".zip", "")
+    upload_prefix = f"{zip_dir}/{zip_name}/" if zip_dir else f"{zip_name}/"
+
+    apps = set()
+    with zipfile.ZipFile(io.BytesIO(zip_obj)) as zf:
+        for name in zf.namelist():
+            # Find event log app directories
+            parts = name.split("/")
+            app_dir = None
+            for p in parts:
+                if p.startswith("eventlog_v2_") or p.startswith("application_"):
+                    app_dir = p
+                    break
+            if not app_dir:
+                continue
+
+            # Upload file to S3 under the extracted prefix
+            if not name.endswith("/"):
+                # Rebuild path relative to the app dir
+                idx = parts.index(app_dir)
+                rel_path = "/".join(parts[idx:])
+                s3_key = f"{upload_prefix}{rel_path}"
+                data = zf.read(name)
+                s3.put_object(Bucket=bucket, Key=s3_key, Body=data)
+                apps.add(f"{bucket}/{upload_prefix}{app_dir}/")
+
+    log.info("Extracted %d app(s) from zip to s3://%s/%s", len(apps), bucket, upload_prefix)
+    return list(apps)
 
 
 # ── Tool: Extraction & Recommendations ───────────────────────────────
