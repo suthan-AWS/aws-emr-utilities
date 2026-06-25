@@ -156,21 +156,25 @@ A common pattern: use the T-shirt sizer for the initial run, then feed the resul
 
 ### Config Matrix
 
-| Size | Sub-category | Cores | Memory | maxExec | Total vCPU | Partitions | Disk |
-|------|-------------|-------|--------|---------|-----------|-----------|------|
-| XS | General | 1 | 2G | 3 | 3 | 20 | — |
-| S | General | 4 | 27G | 50 | 200 | 1000 | 200G |
-| S | Optimized | 4 | 27G | 50 | 200 | 1000 | 1000G |
-| S | IO-Optimized | 4 | 27G | 100 | 400 | 1000 | 1000G |
-| M | General | 8 | 54G | 50 | 400 | 1000 | 200G |
-| M | Optimized | 8 | 54G | 50 | 400 | 1000 | 1000G |
-| M | IO-Optimized | 4 | 27G | 100 | 400 | 1000 | 1000G |
-| L | General | 8 | 54G | 100 | 800 | 1000 | 200G |
-| L | Optimized | 8 | 54G | 100 | 800 | 1600 | 1000G |
-| L | IO-Optimized | 4 | 27G | 200 | 800 | 1600 | 1000G |
-| XL | General | 16 | 108G | 125 | 2000 | 2000 | 200G |
-| XL | Optimized | 16 | 108G | 125 | 2000 | 4000 | 1000G |
-| XL | IO-Optimized | 8 | 54G | 250 | 2000 | 4000 | 1000G |
+Worker type (cores/memory) and disk are fixed by size + sub-category. `maxExecutors` and `partitions` use generous defaults for General but are dynamically computed for Optimized/IO-Optimized.
+
+| Size | Sub-category | Cores | Memory | maxExec | Partitions | Disk |
+|------|-------------|-------|--------|---------|-----------|------|
+| XS | General | 1 | 2G | 3 | 20 | — |
+| S | General | 4 | 27G | 50 | 1000 | 200G |
+| S | Optimized | 4 | 27G | f(input) | 2 × maxExec × cores | 1000G |
+| S | IO-Optimized | 4 | 27G | f(input) × 2 | 2 × maxExec × cores | 1000G |
+| M | General | 8 | 54G | 50 | 1000 | 200G |
+| M | Optimized | 8 | 54G | f(input) | 2 × maxExec × cores | 1000G |
+| M | IO-Optimized | 4 | 27G | f(input) × 2 | 2 × maxExec × cores | 1000G |
+| L | General | 8 | 54G | 100 | 1000 | 200G |
+| L | Optimized | 8 | 54G | f(input) | 2 × maxExec × cores | 1000G |
+| L | IO-Optimized | 4 | 27G | f(input) × 2 | 2 × maxExec × cores | 1000G |
+| XL | General | 16 | 108G | 125 | 2000 | 200G |
+| XL | Optimized | 16 | 108G | f(input) | 2 × maxExec × cores | 1000G |
+| XL | IO-Optimized | 8 | 54G | f(input) × 2 | 2 × maxExec × cores | 1000G |
+
+Where `f(input)` = max(compute_floor, shuffle_serving_floor) derived from target duration, shuffle volume, or task-hours. Partitions: min 1000, max 10000.
 
 ---
 
