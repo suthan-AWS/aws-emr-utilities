@@ -49,6 +49,20 @@ python3 emr_s_tshirt_size.py --size S --input-size-gb 3 --fan-out-factor 500
 
 The tool auto-bumps the size and sub-category when shuffle signals indicate a heavier workload than the input size alone suggests.
 
+### Migrating from EC2? Provide Your Current Runtime
+
+If you know how long the job currently takes (from YARN UI, EMR Step history, or the EMR Serverless console), pass it in minutes. The tool will right-size executor count to match that runtime — no over-provisioning:
+
+```bash
+# Job currently takes 45 minutes on EC2:
+python3 emr_s_tshirt_size.py --size L --target-duration-minutes 45
+
+# Job takes 2 hours, with 5TB shuffle:
+python3 emr_s_tshirt_size.py --size XL --target-duration-minutes 120 --shuffle-write-gb 5000
+```
+
+Without `--target-duration-minutes`, the tool uses generous defaults (safe but potentially over-provisioned). With it, executor count is computed precisely from network and disk throughput constraints.
+
 ### For Optimized Runs: Use the Fine Tuner
 
 The T-shirt sizer is a starting point. After your first successful run, pass the event log to the Fine Tuner for precise, measured configs:

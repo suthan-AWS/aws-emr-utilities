@@ -377,6 +377,7 @@ if __name__ == "__main__":
     p.add_argument("--input-size-gb", type=float, help="Input data size in GB")
     p.add_argument("--shuffle-write-gb", type=float, help="Estimated shuffle volume in GB (for heavy joins/aggregations)")
     p.add_argument("--fan-out-factor", type=float, help="Estimated output amplification (for EXPLODE/CROSS JOIN, e.g. 500)")
+    p.add_argument("--target-duration-minutes", type=int, help="Target job runtime in minutes (e.g. current EC2 runtime)")
     p.add_argument("--num-files", type=int, help="Number of files (for Iceberg-Maintenance)")
     p.add_argument("--format", choices=["json", "spark-submit", "table"], default="table")
     args = p.parse_args()
@@ -398,6 +399,7 @@ if __name__ == "__main__":
         num_files=args.num_files,
         shuffle_write_gb=args.shuffle_write_gb,
         fan_out_factor=args.fan_out_factor,
+        target_duration_minutes=args.target_duration_minutes,
     )
 
     # Route
