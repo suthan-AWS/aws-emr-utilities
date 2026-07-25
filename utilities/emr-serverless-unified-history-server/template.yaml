@@ -1,27 +1,63 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Event-driven Spark event log aggregation: S3 Event Notification on the source
-  bucket (EMR Serverless log destination) triggers a Lambda that copies ONLY Spark
-  event logs (under sparklogs/) into a single flat Spark History Server log
-  directory in the destination bucket. Includes SQS DLQ for failed async invocations.
+  Event-driven Spark event log aggregation for EMR Serverless. Copies only Spark
+  event logs (under sparklogs/) into a single flat Spark History Server log directory.
+  Supports two trigger modes: direct S3 Event Notification (greenfield) or EventBridge
+  (pre-existing/shared source bucket). Includes SQS DLQ for failed invocations.
 
 Parameters:
   SourceBucketName:
     Type: String
-    Description: Name for the source bucket (must be globally unique)
+    Description: Name of the source bucket where EMR Serverless writes logs
   DestinationBucketName:
     Type: String
     Description: Name for the destination bucket (must be globally unique)
   LogPrefix:
     Type: String
     Default: logs/applications/
-    Description: Only objects under this prefix trigger the copy Lambda
+    Description: >
+      Only objects under this prefix trigger the copy Lambda. Use
+      'dataproc-emr-serverless/' for platform-managed EMR Serverless environments.
   DestinationPrefix:
     Type: String
     Default: logs/
     Description: >
       Spark History Server log directory in the destination bucket. Event logs land
       at <DestinationPrefix>eventlog_v2_<job-run-id>/... regardless of source app/job.
+  TriggerMode:
+    Type: String
+    Default: S3Notification
+    AllowedValues: [S3Notification, EventBridge]
+    Description: >
+      S3Notification: direct S3 event notification (requires ManageSourceBucket=true).
+      EventBridge: S3 -> EventBridge -> Lambda (works with pre-existing buckets; requires
+      EventBridge notifications enabled on the source bucket by the bucket owner).
+  ManageSourceBucket:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether this stack creates and manages the source bucket. Set to 'false' when
+      the source bucket is pre-existing and externally owned.
+  SourceKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the KMS key used to encrypt objects in the source bucket. Leave empty
+      if the source uses SSE-S3 (AES256) or is unencrypted.
+  DestinationKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the KMS key to encrypt objects in the destination bucket. Leave empty
+      to use SSE-S3 (AES256).
+
+Conditions:
+  UseS3Notification: !Equals [!Ref TriggerMode, S3Notification]
+  UseEventBridge: !Equals [!Ref TriggerMode, EventBridge]
+  CreateSourceBucket: !Equals [!Ref ManageSourceBucket, 'true']
+  HasSourceKms: !Not [!Equals [!Ref SourceKmsKeyArn, '']]
+  HasDestinationKms: !Not [!Equals [!Ref DestinationKmsKeyArn, '']]
 
 Resources:
 
@@ -38,9 +74,10 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: !If [HasDestinationKms, 'aws:kms', AES256]
+              KMSMasterKeyID: !If [HasDestinationKms, !Ref DestinationKmsKeyArn, !Ref 'AWS::NoValue']
 
-  # ---------- DLQ for failed async Lambda invocations ----------
+  # ---------- DLQ for failed invocations ----------
   CopyDlq:
     Type: AWS::SQS::Queue
     Properties:
@@ -82,6 +119,28 @@ Resources:
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt CopyDlq.Arn
+        - !If
+          - HasSourceKms
+          - PolicyName: SourceKmsDecrypt
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SourceKmsKeyArn
+          - !Ref 'AWS::NoValue'
+        - !If
+          - HasDestinationKms
+          - PolicyName: DestinationKmsEncrypt
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:GenerateDataKey
+                    - kms:Encrypt
+                  Resource: !Ref DestinationKmsKeyArn
+          - !Ref 'AWS::NoValue'
 
   # ---------- Lambda function ----------
   CopyFunction:
@@ -113,6 +172,27 @@ Resources:
           SPARKLOGS_MARKER = "/sparklogs/"
           COPY_OBJECT_MAX_BYTES = 5 * 1024 * 1024 * 1024
 
+          def _normalize_events(event):
+              if "Records" in event:
+                  for record in event["Records"]:
+                      try:
+                          bucket = record["s3"]["bucket"]["name"]
+                          key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+                          size = record["s3"]["object"].get("size", 0)
+                          yield bucket, key, size
+                      except KeyError:
+                          logger.error("Malformed S3 notification record: %s", json.dumps(record))
+                          yield None, None, None
+              elif "detail" in event:
+                  detail = event["detail"]
+                  try:
+                      yield detail["bucket"]["name"], detail["object"]["key"], detail["object"].get("size", 0)
+                  except KeyError:
+                      logger.error("Malformed EventBridge detail: %s", json.dumps(event)[:500])
+                      yield None, None, None
+              else:
+                  logger.error("Unrecognized event shape: %s", json.dumps(event)[:500])
+
           def destination_key_for(source_key):
               idx = source_key.find(SPARKLOGS_MARKER)
               if idx == -1:
@@ -120,37 +200,32 @@ Resources:
               return DESTINATION_PREFIX + source_key[idx + len(SPARKLOGS_MARKER):]
 
           def lambda_handler(event, context):
-              records = event.get("Records", [])
               copied, skipped, failed = 0, 0, 0
-              for record in records:
-                  try:
-                      source_bucket = record["s3"]["bucket"]["name"]
-                      source_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-                      size = record["s3"]["object"].get("size", 0)
-                  except KeyError:
-                      logger.error("Malformed record, skipping: %s", json.dumps(record))
+              for bucket, key, size in _normalize_events(event):
+                  if bucket is None:
                       failed += 1
                       continue
-                  destination_key = destination_key_for(source_key)
+                  destination_key = destination_key_for(key)
                   if destination_key is None:
                       skipped += 1
-                      logger.info("Skipped (not a spark event log): s3://%s/%s", source_bucket, source_key)
+                      logger.info("Skipped (not a spark event log): s3://%s/%s", bucket, key)
                       continue
                   try:
                       if size > COPY_OBJECT_MAX_BYTES:
-                          _multipart_copy(source_bucket, source_key, destination_key, size)
+                          _multipart_copy(bucket, key, destination_key, size)
                       else:
                           s3.copy_object(
-                              CopySource={"Bucket": source_bucket, "Key": source_key},
+                              CopySource={"Bucket": bucket, "Key": key},
                               Bucket=DESTINATION_BUCKET, Key=destination_key)
                       copied += 1
                       logger.info("Copied s3://%s/%s -> s3://%s/%s (%d bytes)",
-                                  source_bucket, source_key, DESTINATION_BUCKET, destination_key, size)
+                                  bucket, key, DESTINATION_BUCKET, destination_key, size)
                   except Exception:
                       failed += 1
                       logger.exception("Failed to copy s3://%s/%s -> s3://%s/%s",
-                                       source_bucket, source_key, DESTINATION_BUCKET, destination_key)
-              result = {"copied": copied, "skipped": skipped, "failed": failed, "total": len(records)}
+                                       bucket, key, DESTINATION_BUCKET, destination_key)
+              total = copied + skipped + failed
+              result = {"copied": copied, "skipped": skipped, "failed": failed, "total": total}
               logger.info("Batch complete: %s", json.dumps(result))
               return result
 
@@ -178,9 +253,10 @@ Resources:
                       Bucket=DESTINATION_BUCKET, Key=destination_key, UploadId=upload_id)
                   raise
 
-  # ---------- Permission for S3 to invoke the Lambda ----------
+  # ---------- S3 Notification mode resources (greenfield) ----------
   S3InvokePermission:
     Type: AWS::Lambda::Permission
+    Condition: UseS3Notification
     Properties:
       FunctionName: !Ref CopyFunction
       Action: lambda:InvokeFunction
@@ -188,9 +264,9 @@ Resources:
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !Sub 'arn:aws:s3:::${SourceBucketName}'
 
-  # ---------- Source bucket with event notification ----------
   SourceBucket:
     Type: AWS::S3::Bucket
+    Condition: CreateSourceBucket
     DependsOn: S3InvokePermission
     Properties:
       BucketName: !Ref SourceBucketName
@@ -213,8 +289,62 @@ Resources:
                     Value: !Ref LogPrefix
             Function: !GetAtt CopyFunction.Arn
 
+  # ---------- EventBridge mode resources (pre-existing bucket) ----------
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseEventBridge
+    Properties:
+      FunctionName: !Ref CopyFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Condition: UseEventBridge
+    Properties:
+      Name: !Sub '${AWS::StackName}-s3-object-created'
+      Description: !Sub 'Route S3 Object Created events from ${SourceBucketName} to log copy Lambda'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref SourceBucketName
+          object:
+            key:
+              - prefix: !Ref LogPrefix
+      Targets:
+        - Arn: !GetAtt CopyFunction.Arn
+          Id: copy-fn
+          DeadLetterConfig:
+            Arn: !GetAtt CopyDlq.Arn
+
+  # DLQ policy — allow EventBridge to send failed delivery to the DLQ
+  EventBridgeDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: UseEventBridge
+    Properties:
+      Queues:
+        - !Ref CopyDlq
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt CopyDlq.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt EventBridgeRule.Arn
+
 Outputs:
   SourceBucket:
+    Condition: CreateSourceBucket
     Value: !Ref SourceBucket
   DestinationBucket:
     Value: !Ref DestinationBucket
@@ -222,3 +352,6 @@ Outputs:
     Value: !GetAtt CopyFunction.Arn
   DlqUrl:
     Value: !Ref CopyDlq
+  EventBridgeRuleArn:
+    Condition: UseEventBridge
+    Value: !GetAtt EventBridgeRule.Arn
