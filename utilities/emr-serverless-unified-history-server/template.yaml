@@ -227,6 +227,8 @@ Resources:
               total = copied + skipped + failed
               result = {"copied": copied, "skipped": skipped, "failed": failed, "total": total}
               logger.info("Batch complete: %s", json.dumps(result))
+              if failed > 0:
+                  raise RuntimeError(f"{failed}/{total} copies failed")
               return result
 
           def _multipart_copy(source_bucket, source_key, destination_key, size):

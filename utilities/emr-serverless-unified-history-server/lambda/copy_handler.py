@@ -122,6 +122,10 @@ def lambda_handler(event, context):
     total = copied + skipped + failed
     result = {"copied": copied, "skipped": skipped, "failed": failed, "total": total}
     logger.info("Batch complete: %s", json.dumps(result))
+    if failed > 0:
+        raise RuntimeError(
+            f"{failed}/{total} copies failed — raising to trigger async retry/DLQ"
+        )
     return result
 
 
